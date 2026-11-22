@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 const DEFAULT_BASE_URL: &str = "http://localhost:4000/v1";
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(default)]
 pub struct Settings {
     pub base_url: String,
     pub api_key: String,
@@ -112,6 +113,25 @@ mod tests {
         s.save_to(&path).unwrap();
         assert_eq!(load_from(&path).api_key, "secret");
         assert!(!load_from(&path).include_terminal_context);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn partial_file_keeps_present_fields_and_defaults_rest() {
+        let dir = std::env::temp_dir().join(format!("repterm-partial-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("settings.json");
+
+        std::fs::write(&path, "{\"api_key\":\"sk-secret\"}").unwrap();
+        let loaded = load_from(&path);
+        assert_eq!(loaded.api_key, "sk-secret");
+        assert_eq!(loaded.base_url, Settings::default().base_url);
+        assert_eq!(loaded.model, Settings::default().model);
+        assert_eq!(loaded.include_terminal_context, Settings::default().include_terminal_context);
+
+        std::fs::write(&path, "{not json").unwrap();
+        assert_eq!(load_from(&path), Settings::default());
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }
