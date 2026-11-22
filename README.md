@@ -6,6 +6,8 @@ A fast, simple terminal emulator built with Rust, egui, and egui_term.
 
 - Multiple tabs with keyboard and mouse controls
 - Git and GitHub status in a bar below the tabs
+- Clickable branch chip with a searchable local/remote branch picker
+- Clickable changes chip with a staged/unstaged file list and unified diffs
 - OSC 52 clipboard support
 - Configurable shell via the `SHELL` environment variable
 
@@ -18,6 +20,8 @@ A fast, simple terminal emulator built with Rust, egui, and egui_term.
 | Previous tab | `Ctrl+PageUp` |
 | Next tab | `Ctrl+PageDown` |
 | Delete word | `Ctrl+Backspace` |
+
+Click the branch chip to switch branches (writes `git checkout <branch>` into the active terminal), or the changes chip to open the diff panel. In the branch picker, type to filter, use `↑`/`↓` to navigate, `Enter` to select and `Esc` to cancel.
 
 ## Git and GitHub
 

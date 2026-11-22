@@ -1,5 +1,8 @@
 use crate::events::{classify, Action};
-use crate::gitinfo::{expand_home, format_git_label, open_url, probe, RepoStatus};
+use crate::gitinfo::{
+    branches, change_totals, checkout_command, diff_for, expand_home, format_git_label, open_url,
+    probe, BranchInfo, ChangedFile, RepoStatus,
+};
 use crate::tabs::Tabs;
 use alacritty_terminal::event::WindowSize;
 use alacritty_terminal::term::ClipboardType;
@@ -11,6 +14,20 @@ use egui_term::{
 const TAB_TITLE_CHARS: usize = 32;
 const PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
+const MAX_DIFF_LINES: usize = 5000;
+const ADD_COLOR: egui::Color32 = egui::Color32::from_rgb(0x5f, 0xb8, 0x6a);
+const DEL_COLOR: egui::Color32 = egui::Color32::from_rgb(0xe0, 0x6c, 0x6c);
+const WARN_COLOR: egui::Color32 = egui::Color32::from_rgb(0xd9, 0xa4, 0x41);
+
+type DiffKey = (String, String, bool, u32, u32);
+
+struct Picker {
+    query: String,
+    branches: Option<Vec<BranchInfo>>,
+    selected: usize,
+    focus: bool,
+}
+
 pub struct App {
     tabs: Tabs,
     repo: Option<RepoStatus>,
@@ -19,6 +36,15 @@ pub struct App {
     probe_rx: std::sync::mpsc::Receiver<(String, RepoStatus)>,
     probing: bool,
     last_probe: Option<std::time::Instant>,
+    picker: Option<Picker>,
+    branch_tx: std::sync::mpsc::Sender<(String, Vec<BranchInfo>)>,
+    branch_rx: std::sync::mpsc::Receiver<(String, Vec<BranchInfo>)>,
+    changes_open: bool,
+    selected_file: Option<(String, bool)>,
+    diff_key: Option<DiffKey>,
+    diff_lines: Option<Vec<String>>,
+    diff_tx: std::sync::mpsc::Sender<(DiffKey, Vec<String>)>,
+    diff_rx: std::sync::mpsc::Receiver<(DiffKey, Vec<String>)>,
 }
 
 impl App {
@@ -28,6 +54,8 @@ impl App {
         let mut tabs = Tabs::new();
         tabs.add(&cc.egui_ctx)?;
         let (probe_tx, probe_rx) = std::sync::mpsc::channel();
+        let (branch_tx, branch_rx) = std::sync::mpsc::channel();
+        let (diff_tx, diff_rx) = std::sync::mpsc::channel();
         Ok(Self {
             tabs,
             repo: None,
@@ -36,6 +64,15 @@ impl App {
             probe_rx,
             probing: false,
             last_probe: None,
+            picker: None,
+            branch_tx,
+            branch_rx,
+            changes_open: false,
+            selected_file: None,
+            diff_key: None,
+            diff_lines: None,
+            diff_tx,
+            diff_rx,
         })
     }
 
@@ -46,6 +83,18 @@ impl App {
     }
 
     fn poll_repo(&mut self, ctx: &egui::Context) {
+        while let Ok((path, list)) = self.branch_rx.try_recv() {
+            if let Some(picker) = self.picker.as_mut() {
+                if self.repo_path.as_deref() == Some(path.as_str()) {
+                    picker.branches = Some(list);
+                }
+            }
+        }
+        while let Ok((key, lines)) = self.diff_rx.try_recv() {
+            if self.diff_key.as_ref() == Some(&key) {
+                self.diff_lines = Some(lines);
+            }
+        }
         while let Ok((path, status)) = self.probe_rx.try_recv() {
             self.probing = false;
             if self.repo_path.as_deref() == Some(path.as_str()) {
@@ -74,6 +123,245 @@ impl App {
         let id = self.tabs.active()?;
         let title = self.tabs.title(id)?;
         expand_home(title, std::env::var("HOME").ok().as_deref())
+    }
+
+    fn open_picker(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.repo_path.clone() else {
+            return;
+        };
+        self.picker = Some(Picker {
+            query: String::new(),
+            branches: None,
+            selected: 0,
+            focus: true,
+        });
+        let tx = self.branch_tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let list = branches(&path);
+            let _ = tx.send((path, list));
+            ctx.request_repaint();
+        });
+    }
+
+    fn show_picker(&mut self, ctx: &egui::Context) {
+        let Some(picker) = self.picker.as_mut() else {
+            return;
+        };
+        let (esc, enter, up, down) = ctx.input_mut(|i| {
+            (
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Escape),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+                i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+            )
+        });
+        if esc {
+            self.picker = None;
+            return;
+        }
+        let mut chosen = None;
+        egui::Window::new("Switch branch")
+            .title_bar(false)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_TOP, [0.0, 56.0])
+            .fixed_size([360.0, 320.0])
+            .show(ctx, |ui| {
+                let edit = ui.add(
+                    egui::TextEdit::singleline(&mut picker.query)
+                        .hint_text("Search branches…")
+                        .desired_width(f32::INFINITY),
+                );
+                if picker.focus {
+                    edit.request_focus();
+                    picker.focus = false;
+                }
+                if edit.changed() {
+                    picker.selected = 0;
+                }
+                ui.separator();
+                let Some(list) = picker.branches.as_ref() else {
+                    ui.weak("Loading branches…");
+                    return;
+                };
+                let matches: Vec<usize> = (0..list.len())
+                    .filter(|&i| matches_query(&list[i].name, &picker.query))
+                    .collect();
+                if matches.is_empty() {
+                    ui.weak("No matching branches");
+                    return;
+                }
+                let moved = up || down;
+                if up {
+                    picker.selected = picker.selected.saturating_sub(1);
+                }
+                if down {
+                    picker.selected += 1;
+                }
+                picker.selected = picker.selected.min(matches.len() - 1);
+                if enter {
+                    chosen = Some(matches[picker.selected]);
+                }
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for (row, &i) in matches.iter().enumerate() {
+                            let b = &list[i];
+                            let resp =
+                                ui.selectable_label(row == picker.selected, branch_row(ui, b));
+                            if moved && row == picker.selected {
+                                resp.scroll_to_me(None);
+                            }
+                            if resp.clicked() {
+                                chosen = Some(i);
+                            }
+                        }
+                    });
+            });
+        if let Some(i) = chosen {
+            let picker = self.picker.take();
+            let Some(b) = picker.as_ref().and_then(|p| p.branches.as_ref()?.get(i)) else {
+                return;
+            };
+            if !b.is_current {
+                if let Some(tab) = self.tabs.active_tab_mut() {
+                    tab.backend
+                        .process_command(BackendCommand::Write(checkout_command(b).into_bytes()));
+                }
+                self.last_probe = None;
+            }
+            ctx.request_repaint();
+        }
+    }
+
+    fn show_changes(&mut self, ctx: &egui::Context) {
+        let files: Vec<ChangedFile> = self
+            .repo
+            .as_ref()
+            .map(|r| r.changes.clone())
+            .unwrap_or_default();
+        let (count, added, removed) = change_totals(&files);
+        let valid =
+            |sel: &(String, bool)| files.iter().any(|f| f.path == sel.0 && f.staged == sel.1);
+        if !self.selected_file.as_ref().is_some_and(valid) {
+            self.selected_file = files.first().map(|f| (f.path.clone(), f.staged));
+        }
+        let selected = self
+            .selected_file
+            .as_ref()
+            .and_then(|(p, s)| files.iter().find(|f| &f.path == p && f.staged == *s));
+        let wanted = selected
+            .zip(self.repo_path.as_ref())
+            .map(|(f, repo)| (repo.clone(), f.path.clone(), f.staged, f.added, f.removed));
+        if wanted != self.diff_key {
+            self.diff_key = wanted.clone();
+            self.diff_lines = None;
+            if let (Some(key), Some(file)) = (wanted, selected.cloned()) {
+                let tx = self.diff_tx.clone();
+                let ctx = ctx.clone();
+                std::thread::spawn(move || {
+                    let text = diff_for(&key.0, &file);
+                    let lines = text
+                        .lines()
+                        .take(MAX_DIFF_LINES)
+                        .map(str::to_owned)
+                        .collect();
+                    let _ = tx.send((key, lines));
+                    ctx.request_repaint();
+                });
+            }
+        }
+
+        let mut close = false;
+        let mut pick = None;
+        egui::SidePanel::right("changes")
+            .default_width(360.0)
+            .width_range(280.0..=560.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.strong("Uncommitted changes");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("×").on_hover_text("Close").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+                if count > 0 {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        ui.weak(format!("{count} {}", files_noun(count)));
+                        ui.colored_label(ADD_COLOR, format!("+{added}"));
+                        ui.colored_label(DEL_COLOR, format!("−{removed}"));
+                    });
+                }
+                ui.separator();
+                if files.is_empty() {
+                    ui.weak("Working tree clean");
+                    return;
+                }
+                egui::ScrollArea::vertical()
+                    .id_salt("files")
+                    .max_height(ui.available_height() * 0.4)
+                    .show(ui, |ui| {
+                        for staged in [true, false] {
+                            let group: Vec<&ChangedFile> =
+                                files.iter().filter(|f| f.staged == staged).collect();
+                            if group.is_empty() {
+                                continue;
+                            }
+                            ui.weak(if staged { "Staged" } else { "Unstaged" });
+                            for f in group {
+                                let is_sel = self.selected_file.as_ref()
+                                    == Some(&(f.path.clone(), f.staged));
+                                if ui.selectable_label(is_sel, file_row(f)).clicked() {
+                                    pick = Some((f.path.clone(), f.staged));
+                                }
+                            }
+                        }
+                    });
+                ui.separator();
+                match (&self.diff_lines, selected) {
+                    (None, _) => {
+                        ui.weak("Loading diff…");
+                    }
+                    (Some(lines), Some(f)) if lines.is_empty() => {
+                        ui.weak(if f.status == '?' {
+                            "Untracked file — no diff"
+                        } else {
+                            "No diff available"
+                        });
+                    }
+                    (Some(lines), _) => {
+                        let height = ui.text_style_height(&egui::TextStyle::Monospace);
+                        egui::ScrollArea::both()
+                            .id_salt("diff")
+                            .auto_shrink([false, false])
+                            .show_rows(ui, height, lines.len(), |ui, range| {
+                                for line in &lines[range] {
+                                    let color = match classify_diff_line(line) {
+                                        DiffLine::Add => ADD_COLOR,
+                                        DiffLine::Del => DEL_COLOR,
+                                        DiffLine::Meta => ui.visuals().weak_text_color(),
+                                        DiffLine::Context => ui.visuals().text_color(),
+                                    };
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(line).monospace().color(color),
+                                        )
+                                        .wrap_mode(egui::TextWrapMode::Extend),
+                                    );
+                                }
+                            });
+                    }
+                }
+            });
+        if pick.is_some() {
+            self.selected_file = pick;
+        }
+        if close {
+            self.changes_open = false;
+        }
     }
 
     fn spawn_probe(&mut self, ctx: &egui::Context, path: String) {
@@ -210,11 +498,140 @@ fn default_window_size() -> WindowSize {
     }
 }
 
-fn show_repo_bar(ctx: &egui::Context, repo: &RepoStatus) {
+#[derive(Debug, PartialEq, Eq)]
+enum DiffLine {
+    Add,
+    Del,
+    Meta,
+    Context,
+}
+
+fn classify_diff_line(line: &str) -> DiffLine {
+    const META: [&str; 8] = [
+        "@@",
+        "+++",
+        "---",
+        "diff ",
+        "index ",
+        "new file",
+        "deleted file",
+        "similarity",
+    ];
+    if META.iter().any(|p| line.starts_with(p)) {
+        DiffLine::Meta
+    } else if line.starts_with('+') {
+        DiffLine::Add
+    } else if line.starts_with('-') {
+        DiffLine::Del
+    } else {
+        DiffLine::Context
+    }
+}
+
+fn matches_query(name: &str, query: &str) -> bool {
+    let query = query.trim();
+    query.is_empty() || name.to_lowercase().contains(&query.to_lowercase())
+}
+
+fn files_noun(count: usize) -> &'static str {
+    if count == 1 {
+        "file"
+    } else {
+        "files"
+    }
+}
+
+fn text_format(ui: &egui::Ui, color: egui::Color32) -> egui::TextFormat {
+    egui::TextFormat {
+        font_id: egui::TextStyle::Body.resolve(ui.style()),
+        color,
+        ..Default::default()
+    }
+}
+
+fn branch_row(ui: &egui::Ui, b: &BranchInfo) -> egui::text::LayoutJob {
+    let normal = ui.visuals().text_color();
+    let dim = ui.visuals().weak_text_color();
+    let mut job = egui::text::LayoutJob::default();
+    if b.is_current {
+        job.append("● ", 0.0, text_format(ui, ADD_COLOR));
+    } else {
+        job.append("   ", 0.0, text_format(ui, dim));
+    }
+    match b.name.split_once('/').filter(|_| b.is_remote) {
+        Some((remote, rest)) => {
+            job.append(&format!("{remote}/"), 0.0, text_format(ui, dim));
+            job.append(rest, 0.0, text_format(ui, normal));
+        }
+        None => job.append(&b.name, 0.0, text_format(ui, normal)),
+    }
+    job
+}
+
+fn file_row(f: &ChangedFile) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    let font = egui::FontId::monospace(12.0);
+    let mut part = |text: &str, color: egui::Color32| {
+        job.append(
+            text,
+            0.0,
+            egui::TextFormat {
+                font_id: font.clone(),
+                color,
+                ..Default::default()
+            },
+        );
+    };
+    let status_color = match f.status {
+        'A' | '?' => ADD_COLOR,
+        'D' => DEL_COLOR,
+        _ => WARN_COLOR,
+    };
+    part(&format!("{} ", f.status), status_color);
+    part(&clip_title(&f.path, 34), egui::Color32::GRAY);
+    if f.added > 0 || f.removed > 0 {
+        part(&format!("  +{}", f.added), ADD_COLOR);
+        part(&format!(" −{}", f.removed), DEL_COLOR);
+    }
+    job
+}
+
+fn chip(ui: &mut egui::Ui, job: egui::text::LayoutJob) -> egui::Response {
+    ui.add(
+        egui::Button::new(job)
+            .fill(ui.visuals().widgets.inactive.weak_bg_fill)
+            .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+            .corner_radius(10.0)
+            .min_size(egui::vec2(0.0, 20.0)),
+    )
+}
+
+/// Draws the git chip bar; returns (branch chip clicked, changes chip clicked).
+fn show_repo_bar(ctx: &egui::Context, repo: &RepoStatus) -> (bool, bool) {
+    let mut clicks = (false, false);
     egui::TopBottomPanel::top("git").show(ctx, |ui| {
         ui.horizontal(|ui| {
+            let text = ui.visuals().text_color();
             if let Some(git) = &repo.git {
-                ui.label(format_git_label(git));
+                let mut job = egui::text::LayoutJob::default();
+                job.append(
+                    &format!("{} ▾", format_git_label(git)),
+                    0.0,
+                    text_format(ui, text),
+                );
+                clicks.0 = chip(ui, job).on_hover_text("Switch branch").clicked();
+            }
+            let (count, added, removed) = change_totals(&repo.changes);
+            if count > 0 {
+                let mut job = egui::text::LayoutJob::default();
+                job.append(
+                    &format!("{count} {} · ", files_noun(count)),
+                    0.0,
+                    text_format(ui, WARN_COLOR),
+                );
+                job.append(&format!("+{added} "), 0.0, text_format(ui, ADD_COLOR));
+                job.append(&format!("−{removed}"), 0.0, text_format(ui, DEL_COLOR));
+                clicks.1 = chip(ui, job).on_hover_text("View changes").clicked();
             }
             if let Some(pr) = &repo.pr {
                 let label = format!("#{} {}", pr.number, pr.state.to_lowercase());
@@ -224,6 +641,7 @@ fn show_repo_bar(ctx: &egui::Context, repo: &RepoStatus) {
             }
         });
     });
+    clicks
 }
 
 fn ctrl_backspace_bindings() -> Vec<(Binding<InputKind>, BindingAction)> {
@@ -301,14 +719,24 @@ impl eframe::App for App {
         });
 
         if let Some(repo) = self.repo.clone().filter(|repo| repo.git.is_some()) {
-            show_repo_bar(ctx, &repo);
+            let (branch, changes) = show_repo_bar(ctx, &repo);
+            if branch {
+                self.open_picker(ctx);
+            }
+            if changes {
+                self.changes_open = !self.changes_open;
+            }
         }
+        if self.changes_open {
+            self.show_changes(ctx);
+        }
+        self.show_picker(ctx);
 
         egui::CentralPanel::default().show(ctx, |ui| {
             let size = ui.available_size();
             if let Some(tab) = self.tabs.active_tab_mut() {
                 let terminal = TerminalView::new(ui, &mut tab.backend)
-                    .set_focus(true)
+                    .set_focus(self.picker.is_none())
                     .set_size(size)
                     .add_bindings(ctrl_backspace_bindings());
                 ui.add(terminal);
@@ -323,7 +751,10 @@ impl eframe::App for App {
 
 #[cfg(test)]
 mod tests {
-    use super::{clip_title, ctrl_backspace_bindings, tab_label};
+    use super::{
+        classify_diff_line, clip_title, ctrl_backspace_bindings, files_noun, matches_query,
+        tab_label, DiffLine,
+    };
     use egui_term::{BindingAction, InputKind};
 
     #[test]
@@ -364,5 +795,27 @@ mod tests {
         );
         assert_eq!(bindings[0].0.modifiers, egui::Modifiers::CTRL);
         assert_eq!(bindings[0].1, BindingAction::Esc("\x1b\x7f".to_owned()));
+    }
+
+    #[test]
+    fn diff_lines_are_classified() {
+        assert_eq!(classify_diff_line("+++ b/a"), DiffLine::Meta);
+        assert_eq!(classify_diff_line("@@ -1 +1 @@"), DiffLine::Meta);
+        assert_eq!(classify_diff_line("+x"), DiffLine::Add);
+        assert_eq!(classify_diff_line("-x"), DiffLine::Del);
+        assert_eq!(classify_diff_line(" x"), DiffLine::Context);
+    }
+
+    #[test]
+    fn branch_filter_is_case_insensitive() {
+        assert!(matches_query("origin/Feature-X", "feature"));
+        assert!(matches_query("main", "  "));
+        assert!(!matches_query("main", "dev"));
+    }
+
+    #[test]
+    fn files_noun_pluralizes() {
+        assert_eq!(files_noun(1), "file");
+        assert_eq!(files_noun(2), "files");
     }
 }
