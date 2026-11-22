@@ -1,3 +1,4 @@
+use crate::chat_view::{self, CHAT_ACCENT};
 use crate::events::{classify, Action};
 use crate::gitinfo::{
     branches, change_totals, checkout_command, diff_for, expand_home, format_git_label, open_url,
@@ -315,11 +316,183 @@ impl App {
         tab.backend
             .process_command(BackendCommand::Write(format!("{command}\n").into_bytes()));
         self.chat.input.clear();
-        self.chat.messages.push(ChatMessage::user(format!("!{command}")));
+        self.chat
+            .messages
+            .push(ChatMessage::user(format!("!{command}")));
         self.chat.error = None;
         self.line_clean.insert(id, true);
         self.chat_open = false;
         ctx.request_repaint();
+    }
+
+    fn insert_command(&mut self, text: &str, ctx: &egui::Context) {
+        let Ok(id) = command_target(self.tabs.active()) else {
+            self.chat.error = Some("No hay pestaña activa para insertar el comando".to_owned());
+            return;
+        };
+        if let Some(tab) = self.tabs.tab_mut(id) {
+            tab.backend
+                .process_command(BackendCommand::Write(text.as_bytes().to_vec()));
+        }
+        self.line_clean.insert(id, false);
+        ctx.memory_mut(|m| m.request_focus(chat_composer_id()));
+    }
+
+    fn show_chat(&mut self, ctx: &egui::Context) {
+        let streaming = self.chat.rx.is_some();
+        let mut close = false;
+        let mut open_settings = false;
+        let mut submit = false;
+        let mut cancel = false;
+        let mut retry = false;
+        let mut insert: Option<String> = None;
+        let composer_id = chat_composer_id();
+
+        egui::TopBottomPanel::top("chat_header")
+            .exact_height(34.0)
+            .show(ctx, |ui| {
+                ui.horizontal_centered(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    ui.strong("AI chat");
+                    let (color, hint) = if self.chat.error.is_some() {
+                        (DEL_COLOR, "error")
+                    } else if streaming {
+                        (WARN_COLOR, "streaming")
+                    } else if self.settings.api_key.trim().is_empty() {
+                        (WARN_COLOR, "sin clave configurada")
+                    } else {
+                        (ADD_COLOR, "listo")
+                    };
+                    ui.colored_label(color, "●").on_hover_text(hint);
+                    let model = if self.settings.model.trim().is_empty() {
+                        "modelo no configurado"
+                    } else {
+                        self.settings.model.as_str()
+                    };
+                    ui.weak(model);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("×").on_hover_text("Cerrar chat").clicked() {
+                            close = true;
+                        }
+                        if ui.small_button("Ajustes").clicked() {
+                            open_settings = true;
+                        }
+                    });
+                });
+            });
+
+        egui::TopBottomPanel::bottom("chat_composer")
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                if streaming {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.weak("Generando…");
+                    });
+                }
+                if let Some(error) = &self.chat.error {
+                    ui.horizontal(|ui| {
+                        ui.colored_label(DEL_COLOR, "Error:");
+                        ui.label(error);
+                    });
+                }
+                if ctx.memory(|m| m.has_focus(composer_id)) && consume_plain_enter(ctx) {
+                    if !streaming {
+                        submit = true;
+                    }
+                }
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.chat.input)
+                        .id(composer_id)
+                        .font(egui::TextStyle::Monospace)
+                        .desired_rows(3)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("Pregunta al agente o escribe !comando"),
+                );
+                ui.horizontal(|ui| {
+                    let can_send = !self.chat.input.trim().is_empty() && !streaming;
+                    if ui
+                        .add_enabled(can_send, egui::Button::new("Enviar"))
+                        .clicked()
+                    {
+                        submit = true;
+                    }
+                    if streaming {
+                        if ui.button("Cancelar").clicked() {
+                            cancel = true;
+                        }
+                    } else if self.chat.error.is_some() && ui.button("Reintentar").clicked() {
+                        retry = true;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.weak("Enter envía · Shift+Enter salto");
+                    });
+                });
+                ui.add_space(4.0);
+            });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let visuals = ui.visuals().clone();
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .stick_to_bottom(true)
+                .show(ui, |ui| {
+                    ui.add_space(8.0);
+                    let max_width = (ui.available_width() * 0.7).max(160.0);
+                    for message in &self.chat.messages {
+                        chat_bubble(ui, message, max_width, &visuals);
+                        if message.role == Role::Assistant {
+                            for block in chat_view::code_blocks(&message.content) {
+                                if ui.small_button("Insertar en terminal").clicked() {
+                                    insert = Some(block);
+                                }
+                            }
+                        }
+                        ui.add_space(6.0);
+                    }
+                    if !self.chat.partial.is_empty() {
+                        let cursor = if blink(ui) { "▌" } else { "" };
+                        let text = format!("{}{cursor}", self.chat.partial);
+                        bubble_text(ui, &text, max_width, &visuals);
+                        ui.add_space(6.0);
+                    }
+                    if self.chat.cancelled {
+                        ui.weak("(cancelado)");
+                        ui.add_space(6.0);
+                    }
+                    if self.chat.messages.is_empty()
+                        && self.chat.partial.is_empty()
+                        && self.chat.error.is_none()
+                    {
+                        ui.add_space(24.0);
+                        ui.vertical_centered(|ui| {
+                            ui.weak(
+                                "Pregunta sobre el repo o escribe !comando para ejecutarlo en el terminal.",
+                            );
+                        });
+                    }
+                });
+        });
+
+        if let Some(block) = insert {
+            self.insert_command(&block, ctx);
+        }
+        if cancel {
+            self.cancel_chat();
+        }
+        if retry {
+            self.retry_chat(ctx);
+        }
+        if submit {
+            self.submit_chat(ctx);
+        }
+        if close {
+            self.chat_open = false;
+        }
+        if open_settings {
+            self.settings_open = true;
+            self.picker = None;
+        }
     }
 
     fn poll_repo(&mut self, ctx: &egui::Context) {
@@ -785,6 +958,104 @@ fn chat_composer_id() -> egui::Id {
     egui::Id::new("chat_composer")
 }
 
+fn blink(ui: &egui::Ui) -> bool {
+    (ui.input(|input| input.time) * 2.0).fract() < 0.5
+}
+
+fn consume_plain_enter(ctx: &egui::Context) -> bool {
+    let mut consumed = false;
+    ctx.input_mut(|input| {
+        let position = input.events.iter().position(|event| {
+            matches!(
+                event,
+                egui::Event::Key {
+                    key: egui::Key::Enter,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } if !modifiers.shift && !modifiers.ctrl && !modifiers.command && !modifiers.alt
+            )
+        });
+        if let Some(position) = position {
+            input.events.remove(position);
+            consumed = true;
+        }
+    });
+    consumed
+}
+
+fn user_layout(text: &str) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    job.append(
+        text,
+        0.0,
+        egui::TextFormat {
+            font_id: egui::FontId::monospace(12.0),
+            color: egui::Color32::WHITE,
+            ..Default::default()
+        },
+    );
+    job
+}
+
+fn bubble_frame(
+    ui: &mut egui::Ui,
+    fill: egui::Color32,
+    max_width: f32,
+    add: impl FnOnce(&mut egui::Ui),
+) {
+    egui::Frame::NONE
+        .fill(fill)
+        .corner_radius(10.0)
+        .inner_margin(egui::Margin::symmetric(12, 10))
+        .show(ui, |ui| {
+            ui.set_max_width(max_width);
+            add(ui);
+        });
+}
+
+fn chat_bubble(
+    ui: &mut egui::Ui,
+    message: &ChatMessage,
+    max_width: f32,
+    visuals: &egui::Visuals,
+) {
+    let wrap_width = (max_width - 24.0).max(80.0);
+    if message.role == Role::User {
+        let mut job = user_layout(&message.content);
+        job.wrap.max_width = wrap_width;
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
+            bubble_frame(ui, CHAT_ACCENT, max_width, |ui| {
+                ui.add(egui::Label::new(job));
+            });
+        });
+    } else {
+        let mut job = chat_view::markdown_layout(&message.content, visuals);
+        job.wrap.max_width = wrap_width;
+        bubble_frame(
+            ui,
+            visuals.widgets.noninteractive.weak_bg_fill,
+            max_width,
+            |ui| {
+                ui.add(egui::Label::new(job));
+            },
+        );
+    }
+}
+
+fn bubble_text(ui: &mut egui::Ui, text: &str, max_width: f32, visuals: &egui::Visuals) {
+    let mut job = chat_view::markdown_layout(text, visuals);
+    job.wrap.max_width = (max_width - 24.0).max(80.0);
+    bubble_frame(
+        ui,
+        visuals.widgets.noninteractive.weak_bg_fill,
+        max_width,
+        |ui| {
+            ui.add(egui::Label::new(job));
+        },
+    );
+}
+
 pub fn bang_command(input: &str) -> Option<&str> {
     let command = input.strip_prefix('!')?.trim();
     if command.is_empty() {
@@ -1099,12 +1370,17 @@ impl eframe::App for App {
         }
         self.show_picker(ctx);
 
-        if self.chat_open {
+        if self.settings_open {
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.centered_and_justified(|ui| {
-                    ui.label("AI chat");
+                    ui.weak("Ajustes");
                 });
             });
+            return;
+        }
+
+        if self.chat_open {
+            self.show_chat(ctx);
         } else {
             egui::CentralPanel::default().show(ctx, |ui| {
                 let size = ui.available_size();
