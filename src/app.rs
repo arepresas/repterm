@@ -3,6 +3,8 @@ use crate::gitinfo::{
     branches, change_totals, checkout_command, diff_for, expand_home, format_git_label, open_url,
     probe, BranchInfo, ChangedFile, RepoStatus,
 };
+use crate::llm::{build_messages, ChatMessage, LlmClient, Role, StreamUpdate};
+use crate::settings::{self, Settings};
 use crate::tabs::Tabs;
 use alacritty_terminal::event::WindowSize;
 use alacritty_terminal::term::ClipboardType;
@@ -10,6 +12,10 @@ use alacritty_terminal::vte::ansi::Rgb;
 use egui_term::{
     BackendCommand, Binding, BindingAction, InputKind, TerminalBackend, TerminalMode, TerminalView,
 };
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Receiver;
+use std::sync::Arc;
 
 const TAB_TITLE_CHARS: usize = 32;
 const PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
@@ -18,8 +24,34 @@ const MAX_DIFF_LINES: usize = 5000;
 const ADD_COLOR: egui::Color32 = egui::Color32::from_rgb(0x5f, 0xb8, 0x6a);
 const DEL_COLOR: egui::Color32 = egui::Color32::from_rgb(0xe0, 0x6c, 0x6c);
 const WARN_COLOR: egui::Color32 = egui::Color32::from_rgb(0xd9, 0xa4, 0x41);
+const MAX_TERMINAL_CONTEXT_CHARS: usize = 8000;
+const MAX_CONTEXT_LINES: usize = 120;
 
 type DiffKey = (String, String, bool, u32, u32);
+
+pub struct ChatState {
+    pub messages: Vec<ChatMessage>,
+    pub input: String,
+    pub partial: String,
+    pub error: Option<String>,
+    pub cancelled: bool,
+    pub cancel: Arc<AtomicBool>,
+    pub rx: Option<Receiver<StreamUpdate>>,
+}
+
+impl ChatState {
+    fn new() -> Self {
+        Self {
+            messages: Vec::new(),
+            input: String::new(),
+            partial: String::new(),
+            error: None,
+            cancelled: false,
+            cancel: Arc::new(AtomicBool::new(false)),
+            rx: None,
+        }
+    }
+}
 
 struct Picker {
     query: String,
@@ -45,6 +77,11 @@ pub struct App {
     diff_lines: Option<Vec<String>>,
     diff_tx: std::sync::mpsc::Sender<(DiffKey, Vec<String>)>,
     diff_rx: std::sync::mpsc::Receiver<(DiffKey, Vec<String>)>,
+    chat_open: bool,
+    chat: ChatState,
+    settings: Settings,
+    settings_open: bool,
+    line_clean: HashMap<u64, bool>,
 }
 
 impl App {
@@ -73,6 +110,11 @@ impl App {
             diff_lines: None,
             diff_tx,
             diff_rx,
+            chat_open: false,
+            chat: ChatState::new(),
+            settings: settings::load(),
+            settings_open: false,
+            line_clean: HashMap::new(),
         })
     }
 
@@ -80,6 +122,204 @@ impl App {
         if let Err(err) = self.tabs.add(ctx) {
             log::error!("failed to add tab: {err}");
         }
+    }
+
+    fn sync_line_clean(&mut self) {
+        let ids = self.tabs.ids();
+        self.line_clean.retain(|id, _| ids.contains(id));
+        for id in ids {
+            self.line_clean.entry(id).or_insert(true);
+        }
+    }
+
+    fn open_chat(&mut self, ctx: &egui::Context) {
+        self.chat_open = true;
+        self.picker = None;
+        ctx.memory_mut(|m| m.request_focus(chat_composer_id()));
+    }
+
+    fn toggle_chat(&mut self, ctx: &egui::Context) {
+        if self.chat_open {
+            self.chat_open = false;
+        } else {
+            self.open_chat(ctx);
+        }
+    }
+
+    fn terminal_lines(&mut self) -> Vec<String> {
+        let Some(tab) = self.tabs.active_tab_mut() else {
+            return Vec::new();
+        };
+        let mut lines: std::collections::BTreeMap<i32, String> = std::collections::BTreeMap::new();
+        for indexed in tab.backend.last_content().grid.display_iter() {
+            lines
+                .entry(indexed.point.line.0)
+                .or_default()
+                .push(indexed.c);
+        }
+        let mut lines: Vec<String> = lines
+            .into_values()
+            .map(|line| line.trim_end().to_owned())
+            .collect();
+        while lines.last().is_some_and(|line| line.is_empty()) {
+            lines.pop();
+        }
+        let start = lines.len().saturating_sub(MAX_CONTEXT_LINES);
+        lines.split_off(start)
+    }
+
+    fn chat_context(&mut self) -> String {
+        let cwd = self.active_cwd();
+        let selection = self
+            .tabs
+            .active_tab_mut()
+            .map(|tab| tab.backend.selectable_content())
+            .unwrap_or_default();
+        let selection = selection.trim();
+        let lines = self.terminal_lines();
+        build_context(
+            self.repo.as_ref(),
+            cwd.as_deref(),
+            Some(selection).filter(|text| !text.is_empty()),
+            &lines,
+            self.settings.include_terminal_context,
+        )
+    }
+
+    fn send_chat(&mut self, ctx: &egui::Context) {
+        if self.chat.input.trim().is_empty() || self.chat.rx.is_some() {
+            return;
+        }
+        if self.settings.base_url.trim().is_empty() {
+            self.chat.error = Some("Configura la Base URL en Ajustes".to_owned());
+            return;
+        }
+        if self.settings.model.trim().is_empty() {
+            self.chat.error = Some("Configura un modelo en Ajustes".to_owned());
+            return;
+        }
+        let input = std::mem::take(&mut self.chat.input);
+        self.chat.messages.push(ChatMessage::user(input.trim()));
+        self.chat.partial.clear();
+        self.chat.error = None;
+        self.chat.cancelled = false;
+        let context = self.chat_context();
+        let messages = build_messages(&context, &self.chat.messages);
+        let client = LlmClient {
+            base_url: self.settings.base_url.clone(),
+            api_key: self.settings.api_key.clone(),
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        self.chat.cancel = client.cancel.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.chat.rx = Some(rx);
+        let model = self.settings.model.clone();
+        std::thread::spawn(move || {
+            if let Err(err) = client.stream(&model, &messages, &tx) {
+                let _ = tx.send(StreamUpdate::Error(err));
+            }
+        });
+        ctx.memory_mut(|m| m.request_focus(chat_composer_id()));
+        ctx.request_repaint();
+    }
+
+    fn poll_chat(&mut self, ctx: &egui::Context) {
+        let Some(rx) = self.chat.rx.take() else {
+            return;
+        };
+        let mut finished = false;
+        let mut disconnected = false;
+        loop {
+            match rx.try_recv() {
+                Ok(StreamUpdate::Delta(delta)) => self.chat.partial.push_str(&delta),
+                Ok(StreamUpdate::Done) => {
+                    finished = true;
+                    break;
+                }
+                Ok(StreamUpdate::Error(err)) => {
+                    self.chat.error = Some(err);
+                    finished = true;
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+        if finished || disconnected {
+            if !self.chat.partial.is_empty() {
+                let partial = std::mem::take(&mut self.chat.partial);
+                self.chat.messages.push(ChatMessage::assistant(partial));
+            }
+            if disconnected && self.chat.error.is_none() {
+                self.chat.error = Some("La conexión terminó inesperadamente".to_owned());
+            }
+            self.chat.cancelled = false;
+        } else {
+            self.chat.rx = Some(rx);
+            ctx.request_repaint();
+        }
+    }
+
+    fn cancel_chat(&mut self) {
+        if self.chat.rx.take().is_none() {
+            return;
+        }
+        self.chat.cancel.store(true, Ordering::Relaxed);
+        if !self.chat.partial.is_empty() {
+            let partial = std::mem::take(&mut self.chat.partial);
+            self.chat.messages.push(ChatMessage::assistant(partial));
+            self.chat.cancelled = true;
+        }
+    }
+
+    fn retry_chat(&mut self, ctx: &egui::Context) {
+        self.chat.error = None;
+        let Some(index) = self
+            .chat
+            .messages
+            .iter()
+            .rposition(|message| matches!(message.role, Role::User))
+        else {
+            return;
+        };
+        let message = self.chat.messages.remove(index);
+        self.chat.messages.truncate(index);
+        self.chat.input = message.content;
+        self.send_chat(ctx);
+    }
+
+    fn submit_chat(&mut self, ctx: &egui::Context) {
+        let text = self.chat.input.trim().to_owned();
+        if text.is_empty() {
+            return;
+        }
+        if let Some(command) = bang_command(&text) {
+            self.run_bang(command, ctx);
+            return;
+        }
+        self.send_chat(ctx);
+    }
+
+    fn run_bang(&mut self, command: &str, ctx: &egui::Context) {
+        let Ok(id) = command_target(self.tabs.active()) else {
+            self.chat.error = Some("No hay pestaña activa para ejecutar el comando".to_owned());
+            return;
+        };
+        let Some(tab) = self.tabs.tab_mut(id) else {
+            self.chat.error = Some("No hay pestaña activa para ejecutar el comando".to_owned());
+            return;
+        };
+        tab.backend
+            .process_command(BackendCommand::Write(format!("{command}\n").into_bytes()));
+        self.chat.input.clear();
+        self.chat.messages.push(ChatMessage::user(format!("!{command}")));
+        self.chat.error = None;
+        self.line_clean.insert(id, true);
+        self.chat_open = false;
+        ctx.request_repaint();
     }
 
     fn poll_repo(&mut self, ctx: &egui::Context) {
@@ -541,6 +781,110 @@ fn files_noun(count: usize) -> &'static str {
     }
 }
 
+fn chat_composer_id() -> egui::Id {
+    egui::Id::new("chat_composer")
+}
+
+pub fn bang_command(input: &str) -> Option<&str> {
+    let command = input.strip_prefix('!')?.trim();
+    if command.is_empty() {
+        None
+    } else {
+        Some(command)
+    }
+}
+
+fn is_bang_text_event(event: &egui::Event) -> bool {
+    matches!(event, egui::Event::Text(text) if text == "!")
+}
+
+fn command_target(active: Option<u64>) -> Result<u64, ()> {
+    active.ok_or(())
+}
+
+fn take_bang_event(ctx: &egui::Context) -> bool {
+    let mut removed = false;
+    ctx.input_mut(|input| {
+        if let Some(index) = input.events.iter().position(is_bang_text_event) {
+            input.events.remove(index);
+            removed = true;
+        }
+    });
+    removed
+}
+
+fn track_line_clean(events: &[egui::Event], clean: &mut bool) {
+    for event in events {
+        match event {
+            egui::Event::Key {
+                key: egui::Key::Enter,
+                pressed: true,
+                ..
+            } => *clean = true,
+            egui::Event::Text(text) => {
+                if text != "!" && text.chars().any(|c| !c.is_control()) {
+                    *clean = false;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn tail_chars(text: &str, max: usize) -> String {
+    let count = text.chars().count();
+    if count <= max {
+        text.to_owned()
+    } else {
+        text.chars().skip(count - max).collect()
+    }
+}
+
+fn build_context(
+    repo: Option<&RepoStatus>,
+    cwd: Option<&str>,
+    selection: Option<&str>,
+    lines: &[String],
+    include_terminal: bool,
+) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "Directorio: {}\n",
+        cwd.unwrap_or("(desconocido)")
+    ));
+    if let Some(repo) = repo {
+        if let Some(git) = &repo.git {
+            out.push_str(&format!("Rama: {}\n", format_git_label(git)));
+        }
+        if repo.changes.is_empty() {
+            out.push_str("Cambios pendientes: ninguno\n");
+        } else {
+            out.push_str("Cambios pendientes:\n");
+            for file in &repo.changes {
+                let staged = if file.staged { "staged" } else { "unstaged" };
+                out.push_str(&format!(
+                    "- {} [{staged}] +{} −{}\n",
+                    file.path, file.added, file.removed
+                ));
+            }
+        }
+    }
+    if include_terminal {
+        if let Some(selection) = selection.map(str::trim).filter(|text| !text.is_empty()) {
+            out.push_str("Selección del terminal:\n");
+            out.push_str(&tail_chars(selection, MAX_TERMINAL_CONTEXT_CHARS));
+            out.push('\n');
+        }
+        if !lines.is_empty() {
+            let joined = lines.join("\n");
+            out.push_str("Últimas líneas del terminal:\n```\n");
+            out.push_str(&tail_chars(&joined, MAX_TERMINAL_CONTEXT_CHARS));
+            out.push_str("\n```\n");
+        }
+    }
+    out
+}
+
 fn text_format(ui: &egui::Ui, color: egui::Color32) -> egui::TextFormat {
     egui::TextFormat {
         font_id: egui::TextStyle::Body.resolve(ui.style()),
@@ -662,28 +1006,51 @@ impl eframe::App for App {
             self.tabs.clear();
         }
 
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::T)) {
-            self.add_tab(ctx);
-        }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::W)) {
-            if let Some(id) = self.tabs.active() {
-                if close_tab(ctx, &mut self.tabs, id) {
-                    return;
+        self.sync_line_clean();
+        self.poll_chat(ctx);
+
+        if !self.settings_open {
+            if ctx.input_mut(|i| {
+                i.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::Enter)
+            }) {
+                self.toggle_chat(ctx);
+            }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::T)) {
+                self.add_tab(ctx);
+            }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::W)) {
+                if let Some(id) = self.tabs.active() {
+                    if close_tab(ctx, &mut self.tabs, id) {
+                        return;
+                    }
                 }
             }
-        }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Delete)) {
-            if let Some(id) = self.tabs.active() {
-                if close_tab(ctx, &mut self.tabs, id) {
-                    return;
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Delete)) {
+                if let Some(id) = self.tabs.active() {
+                    if close_tab(ctx, &mut self.tabs, id) {
+                        return;
+                    }
                 }
             }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::PageUp)) {
+                self.tabs.select_relative(-1);
+            }
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::PageDown)) {
+                self.tabs.select_relative(1);
+            }
         }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::PageUp)) {
-            self.tabs.select_relative(-1);
-        }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::PageDown)) {
-            self.tabs.select_relative(1);
+
+        self.sync_line_clean();
+        if !self.settings_open && !self.chat_open && self.picker.is_none() {
+            if let Some(id) = self.tabs.active() {
+                let events = ctx.input(|i| i.events.clone());
+                let clean = self.line_clean.entry(id).or_insert(true);
+                track_line_clean(&events, clean);
+                if *clean && take_bang_event(ctx) {
+                    self.line_clean.insert(id, false);
+                    self.open_chat(ctx);
+                }
+            }
         }
 
         self.poll_repo(ctx);
@@ -732,28 +1099,36 @@ impl eframe::App for App {
         }
         self.show_picker(ctx);
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let size = ui.available_size();
-            if let Some(tab) = self.tabs.active_tab_mut() {
-                let terminal = TerminalView::new(ui, &mut tab.backend)
-                    .set_focus(self.picker.is_none())
-                    .set_size(size)
-                    .add_bindings(ctrl_backspace_bindings());
-                ui.add(terminal);
-            } else {
+        if self.chat_open {
+            egui::CentralPanel::default().show(ctx, |ui| {
                 ui.centered_and_justified(|ui| {
-                    ui.label("No tabs. Press Ctrl+T to open one.");
+                    ui.label("AI chat");
                 });
-            }
-        });
+            });
+        } else {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let size = ui.available_size();
+                if let Some(tab) = self.tabs.active_tab_mut() {
+                    let terminal = TerminalView::new(ui, &mut tab.backend)
+                        .set_focus(self.picker.is_none())
+                        .set_size(size)
+                        .add_bindings(ctrl_backspace_bindings());
+                    ui.add(terminal);
+                } else {
+                    ui.centered_and_justified(|ui| {
+                        ui.label("No tabs. Press Ctrl+T to open one.");
+                    });
+                }
+            });
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_diff_line, clip_title, ctrl_backspace_bindings, files_noun, matches_query,
-        tab_label, DiffLine,
+        bang_command, build_context, classify_diff_line, clip_title, command_target,
+        ctrl_backspace_bindings, files_noun, is_bang_text_event, matches_query, tab_label, DiffLine,
     };
     use egui_term::{BindingAction, InputKind};
 
@@ -817,5 +1192,41 @@ mod tests {
     fn files_noun_pluralizes() {
         assert_eq!(files_noun(1), "file");
         assert_eq!(files_noun(2), "files");
+    }
+
+    #[test]
+    fn bang_command_strips_prefix_and_ignores_bare_bang() {
+        assert_eq!(bang_command("!git status"), Some("git status"));
+        assert_eq!(bang_command("!"), None);
+        assert_eq!(bang_command("git status"), None);
+    }
+
+    #[test]
+    fn bang_is_text_event_only() {
+        assert!(is_bang_text_event(&egui::Event::Text("!".into())));
+        assert!(!is_bang_text_event(&egui::Event::Text("a".into())));
+        assert!(!is_bang_text_event(&egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE
+        }));
+    }
+
+    #[test]
+    fn command_target_requires_active_tab() {
+        assert_eq!(command_target(Some(7)), Ok(7));
+        assert_eq!(command_target(None), Err(()));
+    }
+
+    #[test]
+    fn context_respects_privacy_switch() {
+        let lines = vec!["SECRETO_LINEA".to_owned()];
+        let full = build_context(None, Some("/repo"), Some("SECRETO_SELECCION"), &lines, true);
+        let redacted = build_context(None, Some("/repo"), Some("SECRETO_SELECCION"), &lines, false);
+        assert!(full.contains("SECRETO_LINEA") && full.contains("SECRETO_SELECCION"));
+        assert!(redacted.contains("/repo"));
+        assert!(!redacted.contains("SECRETO_LINEA") && !redacted.contains("SECRETO_SELECCION"));
     }
 }
