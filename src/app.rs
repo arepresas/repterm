@@ -54,6 +54,50 @@ impl ChatState {
     }
 }
 
+#[derive(Clone)]
+struct SettingsForm {
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+    pub reveal_key: bool,
+}
+
+impl SettingsForm {
+    fn from_settings(settings: &Settings) -> Self {
+        Self {
+            base_url: settings.base_url.clone(),
+            api_key: settings.api_key.clone(),
+            model: settings.model.clone(),
+            reveal_key: false,
+        }
+    }
+
+    fn validate(&self) -> Result<(), &'static str> {
+        if self.base_url.trim().is_empty() {
+            Err("base_url required")
+        } else {
+            Ok(())
+        }
+    }
+
+    fn to_settings(&self) -> Settings {
+        Settings {
+            base_url: self.base_url.trim().to_owned(),
+            api_key: self.api_key.clone(),
+            model: self.model.trim().to_owned(),
+            include_terminal_context: true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsAction {
+    None,
+    Save,
+    Cancel,
+    Refresh,
+}
+
 struct Picker {
     query: String,
     branches: Option<Vec<BranchInfo>>,
@@ -82,7 +126,14 @@ pub struct App {
     chat: ChatState,
     settings: Settings,
     settings_open: bool,
+    settings_form: SettingsForm,
+    settings_include_terminal: bool,
+    settings_save_error: Option<String>,
     line_clean: HashMap<u64, bool>,
+    model_rx: Option<Receiver<Result<Vec<String>, String>>>,
+    model_list: Option<Vec<String>>,
+    model_error: Option<String>,
+    models_loading: bool,
 }
 
 impl App {
@@ -94,6 +145,7 @@ impl App {
         let (probe_tx, probe_rx) = std::sync::mpsc::channel();
         let (branch_tx, branch_rx) = std::sync::mpsc::channel();
         let (diff_tx, diff_rx) = std::sync::mpsc::channel();
+        let settings = settings::load();
         Ok(Self {
             tabs,
             repo: None,
@@ -113,10 +165,197 @@ impl App {
             diff_rx,
             chat_open: false,
             chat: ChatState::new(),
-            settings: settings::load(),
+            settings: settings.clone(),
             settings_open: false,
+            settings_form: SettingsForm::from_settings(&settings),
+            settings_include_terminal: settings.include_terminal_context,
+            settings_save_error: None,
             line_clean: HashMap::new(),
+            model_rx: None,
+            model_list: None,
+            model_error: None,
+            models_loading: false,
         })
+    }
+
+    fn open_settings(&mut self, ctx: &egui::Context) {
+        self.picker = None;
+        self.settings_form = SettingsForm::from_settings(&self.settings);
+        self.settings_include_terminal = self.settings.include_terminal_context;
+        self.settings_save_error = None;
+        self.settings_open = true;
+        self.load_models(ctx);
+    }
+
+    fn load_models(&mut self, ctx: &egui::Context) {
+        let client = LlmClient {
+            base_url: self.settings_form.base_url.clone(),
+            api_key: self.settings_form.api_key.clone(),
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.model_rx = Some(rx);
+        self.model_list = None;
+        self.model_error = None;
+        self.models_loading = true;
+        std::thread::spawn(move || {
+            let _ = tx.send(client.models());
+        });
+        ctx.request_repaint();
+    }
+
+    fn poll_models(&mut self, ctx: &egui::Context) {
+        let results: Vec<_> = self
+            .model_rx
+            .as_ref()
+            .map(|rx| {
+                let mut pending = Vec::new();
+                while let Ok(result) = rx.try_recv() {
+                    pending.push(result);
+                }
+                pending
+            })
+            .unwrap_or_default();
+        for result in results {
+            match result {
+                Ok(models) => {
+                    self.model_list = Some(models);
+                    self.model_error = None;
+                }
+                Err(err) => {
+                    self.model_error = Some(err);
+                    self.model_list = None;
+                }
+            }
+            self.models_loading = false;
+            ctx.request_repaint();
+        }
+    }
+
+    fn show_settings(&mut self, ctx: &egui::Context) {
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            self.settings_open = false;
+            return;
+        }
+        self.poll_models(ctx);
+
+        let mut form = self.settings_form.clone();
+        let mut include = self.settings_include_terminal;
+        let mut action = SettingsAction::None;
+        let save_error = self.settings_save_error.clone().unwrap_or_default();
+        let models = self.model_list.clone();
+        let loading = self.models_loading;
+        let model_error = self.model_error.clone();
+
+        egui::Window::new("Ajustes")
+            .resizable(false)
+            .default_size(egui::vec2(460.0, 340.0))
+            .open(&mut self.settings_open)
+            .show(ctx, |ui| {
+                ui.label("Base URL");
+                ui.text_edit_singleline(&mut form.base_url);
+
+                ui.horizontal(|ui| {
+                    ui.label("API key");
+                    let eye = if form.reveal_key { "🙈" } else { "👁" };
+                    if ui
+                        .button(eye)
+                        .on_hover_text("Mostrar u ocultar la clave")
+                        .clicked()
+                    {
+                        form.reveal_key = !form.reveal_key;
+                    }
+                });
+                egui::TextEdit::singleline(&mut form.api_key)
+                    .password(!form.reveal_key)
+                    .show(ui);
+
+                ui.horizontal(|ui| {
+                    ui.label("Modelo");
+                    if ui
+                        .small_button("↻")
+                        .on_hover_text("Recargar modelos")
+                        .clicked()
+                    {
+                        action = SettingsAction::Refresh;
+                    }
+                });
+                let selected = if form.model.is_empty() {
+                    "manual".to_owned()
+                } else {
+                    form.model.clone()
+                };
+                egui::ComboBox::from_id_salt("llm-model")
+                    .selected_text(selected)
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_label(form.model.is_empty(), "manual")
+                            .clicked()
+                        {
+                            form.model.clear();
+                        }
+                        if let Some(list) = &models {
+                            for model in list {
+                                if ui.selectable_label(form.model == *model, model).clicked() {
+                                    form.model = model.clone();
+                                }
+                            }
+                        }
+                    });
+                ui.text_edit_singleline(&mut form.model);
+                if loading {
+                    ui.weak("Cargando modelos…");
+                }
+                if let Some(err) = &model_error {
+                    ui.colored_label(WARN_COLOR, "Modelos no disponibles")
+                        .on_hover_text(err);
+                    if ui.small_button("Reintentar").clicked() {
+                        action = SettingsAction::Refresh;
+                    }
+                }
+
+                ui.checkbox(&mut include, "Incluir contexto del terminal");
+                if !save_error.is_empty() {
+                    ui.colored_label(DEL_COLOR, &save_error);
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Guardar").clicked() {
+                        action = SettingsAction::Save;
+                    }
+                    if ui.button("Cancelar").clicked() {
+                        action = SettingsAction::Cancel;
+                    }
+                });
+            });
+
+        self.settings_form = form;
+        self.settings_include_terminal = include;
+        self.settings_save_error = if save_error.is_empty() {
+            None
+        } else {
+            Some(save_error)
+        };
+
+        match action {
+            SettingsAction::Refresh => self.load_models(ctx),
+            SettingsAction::Cancel => self.settings_open = false,
+            SettingsAction::Save => match self.settings_form.validate() {
+                Err(message) => self.settings_save_error = Some(message.to_owned()),
+                Ok(()) => {
+                    let mut settings = self.settings_form.to_settings();
+                    settings.include_terminal_context = self.settings_include_terminal;
+                    match settings.save() {
+                        Ok(()) => {
+                            self.settings = settings;
+                            self.settings_open = false;
+                            self.settings_save_error = None;
+                        }
+                        Err(err) => self.settings_save_error = Some(err.to_string()),
+                    }
+                }
+            },
+            SettingsAction::None => {}
+        }
     }
 
     fn add_tab(&mut self, ctx: &egui::Context) {
@@ -381,55 +620,52 @@ impl App {
                 });
             });
 
-        egui::TopBottomPanel::bottom("chat_composer")
-            .show(ctx, |ui| {
-                ui.add_space(4.0);
-                if streaming {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.weak("Generando…");
-                    });
-                }
-                if let Some(error) = &self.chat.error {
-                    ui.horizontal(|ui| {
-                        ui.colored_label(DEL_COLOR, "Error:");
-                        ui.label(error);
-                    });
-                }
-                if ctx.memory(|m| m.has_focus(composer_id)) && consume_plain_enter(ctx) {
-                    if !streaming {
-                        submit = true;
-                    }
-                }
-                ui.add(
-                    egui::TextEdit::multiline(&mut self.chat.input)
-                        .id(composer_id)
-                        .font(egui::TextStyle::Monospace)
-                        .desired_rows(3)
-                        .desired_width(f32::INFINITY)
-                        .hint_text("Pregunta al agente o escribe !comando"),
-                );
+        egui::TopBottomPanel::bottom("chat_composer").show(ctx, |ui| {
+            ui.add_space(4.0);
+            if streaming {
                 ui.horizontal(|ui| {
-                    let can_send = !self.chat.input.trim().is_empty() && !streaming;
-                    if ui
-                        .add_enabled(can_send, egui::Button::new("Enviar"))
-                        .clicked()
-                    {
-                        submit = true;
-                    }
-                    if streaming {
-                        if ui.button("Cancelar").clicked() {
-                            cancel = true;
-                        }
-                    } else if self.chat.error.is_some() && ui.button("Reintentar").clicked() {
-                        retry = true;
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.weak("Enter envía · Shift+Enter salto");
-                    });
+                    ui.spinner();
+                    ui.weak("Generando…");
                 });
-                ui.add_space(4.0);
+            }
+            if let Some(error) = &self.chat.error {
+                ui.horizontal(|ui| {
+                    ui.colored_label(DEL_COLOR, "Error:");
+                    ui.label(error);
+                });
+            }
+            if ctx.memory(|m| m.has_focus(composer_id)) && consume_plain_enter(ctx) && !streaming {
+                submit = true;
+            }
+            ui.add(
+                egui::TextEdit::multiline(&mut self.chat.input)
+                    .id(composer_id)
+                    .font(egui::TextStyle::Monospace)
+                    .desired_rows(3)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("Pregunta al agente o escribe !comando"),
+            );
+            ui.horizontal(|ui| {
+                let can_send = !self.chat.input.trim().is_empty() && !streaming;
+                if ui
+                    .add_enabled(can_send, egui::Button::new("Enviar"))
+                    .clicked()
+                {
+                    submit = true;
+                }
+                if streaming {
+                    if ui.button("Cancelar").clicked() {
+                        cancel = true;
+                    }
+                } else if self.chat.error.is_some() && ui.button("Reintentar").clicked() {
+                    retry = true;
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.weak("Enter envía · Shift+Enter salto");
+                });
             });
+            ui.add_space(4.0);
+        });
 
         egui::CentralPanel::default().show(ctx, |ui| {
             let visuals = ui.visuals().clone();
@@ -490,8 +726,7 @@ impl App {
             self.chat_open = false;
         }
         if open_settings {
-            self.settings_open = true;
-            self.picker = None;
+            self.open_settings(ctx);
         }
     }
 
@@ -1014,12 +1249,7 @@ fn bubble_frame(
         });
 }
 
-fn chat_bubble(
-    ui: &mut egui::Ui,
-    message: &ChatMessage,
-    max_width: f32,
-    visuals: &egui::Visuals,
-) {
+fn chat_bubble(ui: &mut egui::Ui, message: &ChatMessage, max_width: f32, visuals: &egui::Visuals) {
     let wrap_width = (max_width - 24.0).max(80.0);
     if message.role == Role::User {
         let mut job = user_layout(&message.content);
@@ -1092,10 +1322,8 @@ fn track_line_clean(events: &[egui::Event], clean: &mut bool) {
                 pressed: true,
                 ..
             } => *clean = true,
-            egui::Event::Text(text) => {
-                if text != "!" && text.chars().any(|c| !c.is_control()) {
-                    *clean = false;
-                }
+            egui::Event::Text(text) if text != "!" && text.chars().any(|c| !c.is_control()) => {
+                *clean = false;
             }
             _ => {}
         }
@@ -1119,10 +1347,7 @@ fn build_context(
     include_terminal: bool,
 ) -> String {
     let mut out = String::new();
-    out.push_str(&format!(
-        "Directorio: {}\n",
-        cwd.unwrap_or("(desconocido)")
-    ));
+    out.push_str(&format!("Directorio: {}\n", cwd.unwrap_or("(desconocido)")));
     if let Some(repo) = repo {
         if let Some(git) = &repo.git {
             out.push_str(&format!("Rama: {}\n", format_git_label(git)));
@@ -1282,7 +1507,10 @@ impl eframe::App for App {
 
         if !self.settings_open {
             if ctx.input_mut(|i| {
-                i.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::Enter)
+                i.consume_key(
+                    egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+                    egui::Key::Enter,
+                )
             }) {
                 self.toggle_chat(ctx);
             }
@@ -1371,11 +1599,7 @@ impl eframe::App for App {
         self.show_picker(ctx);
 
         if self.settings_open {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                ui.centered_and_justified(|ui| {
-                    ui.weak("Ajustes");
-                });
-            });
+            self.show_settings(ctx);
             return;
         }
 
@@ -1404,7 +1628,8 @@ impl eframe::App for App {
 mod tests {
     use super::{
         bang_command, build_context, classify_diff_line, clip_title, command_target,
-        ctrl_backspace_bindings, files_noun, is_bang_text_event, matches_query, tab_label, DiffLine,
+        ctrl_backspace_bindings, files_noun, is_bang_text_event, matches_query, tab_label,
+        DiffLine, SettingsForm,
     };
     use egui_term::{BindingAction, InputKind};
 
@@ -1497,10 +1722,32 @@ mod tests {
     }
 
     #[test]
+    fn settings_form_requires_base_url_and_keeps_other_fields() {
+        let mut form = SettingsForm {
+            base_url: "".into(),
+            api_key: "k".into(),
+            model: "m".into(),
+            reveal_key: false,
+        };
+        assert_eq!(form.validate(), Err("base_url required"));
+        form.base_url = "http://localhost:4000/v1".into();
+        assert_eq!(form.validate(), Ok(()));
+        let settings = form.to_settings();
+        assert_eq!(settings.api_key, "k");
+        assert_eq!(settings.model, "m");
+    }
+
+    #[test]
     fn context_respects_privacy_switch() {
         let lines = vec!["SECRETO_LINEA".to_owned()];
         let full = build_context(None, Some("/repo"), Some("SECRETO_SELECCION"), &lines, true);
-        let redacted = build_context(None, Some("/repo"), Some("SECRETO_SELECCION"), &lines, false);
+        let redacted = build_context(
+            None,
+            Some("/repo"),
+            Some("SECRETO_SELECCION"),
+            &lines,
+            false,
+        );
         assert!(full.contains("SECRETO_LINEA") && full.contains("SECRETO_SELECCION"));
         assert!(redacted.contains("/repo"));
         assert!(!redacted.contains("SECRETO_LINEA") && !redacted.contains("SECRETO_SELECCION"));
