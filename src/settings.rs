@@ -4,13 +4,24 @@ use std::path::{Path, PathBuf};
 
 const DEFAULT_BASE_URL: &str = "http://localhost:4000/v1";
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 #[serde(default)]
 pub struct Settings {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
     pub include_terminal_context: bool,
+}
+
+impl std::fmt::Debug for Settings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Settings")
+            .field("base_url", &self.base_url)
+            .field("api_key", &"<redacted>")
+            .field("model", &self.model)
+            .field("include_terminal_context", &self.include_terminal_context)
+            .finish()
+    }
 }
 
 impl Default for Settings {
@@ -142,5 +153,16 @@ mod tests {
         assert_eq!(load_from(&path), Settings::default());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn debug_output_redacts_api_key() {
+        let settings = Settings {
+            api_key: "sk-secret".into(),
+            ..Settings::default()
+        };
+        let text = format!("{settings:?}");
+        assert!(text.contains("<redacted>"));
+        assert!(!text.contains("sk-secret"));
     }
 }
