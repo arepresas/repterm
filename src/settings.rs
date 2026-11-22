@@ -95,7 +95,8 @@ mod tests {
 
     #[test]
     fn missing_or_invalid_file_falls_back_to_defaults() {
-        let dir = std::env::temp_dir().join(format!("repterm-settings-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("repterm-settings-test-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("settings.json");
         assert_eq!(load_from(&path).base_url, Settings::default().base_url);
@@ -109,7 +110,12 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("repterm-roundtrip-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("settings.json");
-        let s = Settings { base_url: "http://host:4000/v1".into(), api_key: "secret".into(), model: "gpt-4o-mini".into(), include_terminal_context: false };
+        let s = Settings {
+            base_url: "http://host:4000/v1".into(),
+            api_key: "secret".into(),
+            model: "gpt-4o-mini".into(),
+            include_terminal_context: false,
+        };
         s.save_to(&path).unwrap();
         assert_eq!(load_from(&path).api_key, "secret");
         assert!(!load_from(&path).include_terminal_context);
@@ -127,7 +133,10 @@ mod tests {
         assert_eq!(loaded.api_key, "sk-secret");
         assert_eq!(loaded.base_url, Settings::default().base_url);
         assert_eq!(loaded.model, Settings::default().model);
-        assert_eq!(loaded.include_terminal_context, Settings::default().include_terminal_context);
+        assert_eq!(
+            loaded.include_terminal_context,
+            Settings::default().include_terminal_context
+        );
 
         std::fs::write(&path, "{not json").unwrap();
         assert_eq!(load_from(&path), Settings::default());
