@@ -59,11 +59,21 @@ pub enum StreamUpdate {
     Error(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct LlmClient {
     pub base_url: String,
     pub api_key: String,
     pub cancel: Arc<AtomicBool>,
+}
+
+impl std::fmt::Debug for LlmClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LlmClient")
+            .field("base_url", &self.base_url)
+            .field("api_key", &"<redacted>")
+            .field("cancel", &self.cancel)
+            .finish()
+    }
 }
 
 impl LlmClient {
@@ -271,14 +281,31 @@ mod tests {
 
     #[test]
     fn parse_delta_extracts_text_done_and_errors() {
-        assert_eq!(parse_delta("{\"choices\":[{\"delta\":{\"content\":\"hola\"}}]}").unwrap(), Some("hola".into()));
+        assert_eq!(
+            parse_delta("{\"choices\":[{\"delta\":{\"content\":\"hola\"}}]}").unwrap(),
+            Some("hola".into())
+        );
         assert_eq!(parse_delta("[DONE]").unwrap(), None);
         assert!(parse_delta("{\"error\":{\"message\":\"boom\"}}").is_err());
     }
 
     #[test]
+    fn debug_output_redacts_api_key() {
+        let client = LlmClient {
+            base_url: "http://localhost:4000/v1".into(),
+            api_key: "sk-secret".into(),
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        let text = format!("{client:?}");
+        assert!(text.contains("<redacted>"));
+        assert!(!text.contains("sk-secret"));
+    }
+
+    #[test]
     fn build_messages_refreshes_context_and_caps_history() {
-        let history: Vec<_> = (0..30).map(|i| ChatMessage::user(format!("m{i}"))).collect();
+        let history: Vec<_> = (0..30)
+            .map(|i| ChatMessage::user(format!("m{i}")))
+            .collect();
         let msgs = build_messages("CTX", &history);
         assert_eq!(msgs.len(), 21);
         assert!(matches!(msgs[0].role, Role::System));
