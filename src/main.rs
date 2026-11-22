@@ -3,6 +3,7 @@
 mod app;
 mod events;
 mod gitinfo;
+mod llm;
 mod settings;
 mod shell;
 mod tabs;
