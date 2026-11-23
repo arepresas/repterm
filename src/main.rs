@@ -1,8 +1,11 @@
 #![warn(clippy::all, rust_2018_idioms)]
 
 mod app;
+mod chat_view;
 mod events;
 mod gitinfo;
+mod llm;
+mod settings;
 mod shell;
 mod tabs;
 
