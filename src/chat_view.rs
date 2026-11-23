@@ -76,6 +76,20 @@ pub fn markdown_layout(text: &str, visuals: &Visuals) -> LayoutJob {
     job
 }
 
+/// One-line summary of a tool result, used by the chat transcript.
+///
+/// The full text still goes to the model; this is only what the user sees
+/// before expanding the message.
+pub fn tool_result_summary(content: &str) -> String {
+    let first = content.lines().next().unwrap_or("").trim();
+    let summary = if first.is_empty() {
+        "resultado de herramienta"
+    } else {
+        first
+    };
+    summary.chars().take(100).collect()
+}
+
 /// Returns the fenced code blocks in `text`, trimmed of their trailing
 /// newline, so the UI can offer an "insert in terminal" action per block.
 pub fn code_blocks(text: &str) -> Vec<String> {
@@ -119,5 +133,11 @@ mod tests {
     fn code_blocks_returns_fenced_content_without_trailing_newline() {
         let blocks = code_blocks("antes\n```bash\ngit status\n```\ndespués");
         assert_eq!(blocks, vec!["git status".to_owned()]);
+    }
+
+    #[test]
+    fn tool_result_summary_is_one_line() {
+        let summary = tool_result_summary("list_dir: 42 entradas\na.txt\nb.txt");
+        assert_eq!(summary, "list_dir: 42 entradas");
     }
 }

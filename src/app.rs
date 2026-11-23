@@ -17,7 +17,7 @@ use egui_term::{
     BackendCommand, Binding, BindingAction, InputKind, TerminalBackend, TerminalMode, TerminalView,
 };
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
@@ -35,6 +35,7 @@ const MAX_TOOL_ROUNDS: usize = 8;
 
 type DiffKey = (String, String, bool, u32, u32);
 
+#[derive(Clone)]
 pub struct PermissionRequest {
     pub call: ToolCall,
     pub key: PermissionKey,
@@ -179,6 +180,15 @@ fn apply_permission(
 
 fn clear_tool_turn(chat: &mut ChatState) {
     chat.turn = None;
+}
+
+fn permission_rows(request: &PermissionRequest) -> [(&'static str, String); 4] {
+    [
+        ("Herramienta", request.call.name.clone()),
+        ("Ruta", request.key.path.display().to_string()),
+        ("Directorio de la pestaña", String::new()),
+        ("Motivo", request.reason.clone()),
+    ]
 }
 
 #[derive(Clone)]
@@ -935,8 +945,59 @@ impl App {
             .unwrap_or_default()
     }
 
+    fn show_permission(&mut self, ctx: &egui::Context) {
+        let Some(turn) = self.chat.turn.as_ref() else {
+            return;
+        };
+        let Some(request) = turn.permission.clone() else {
+            return;
+        };
+        let cwd = turn.cwd.display().to_string();
+        let mut rows = permission_rows(&request);
+        rows[2].1 = cwd;
+        let mut decision = None;
+
+        let modal = egui::Modal::new(egui::Id::new("repterm-tool-permission")).show(ctx, |ui| {
+            ui.set_width(420.0);
+            ui.strong(format!(
+                "Permiso solicitado: {} ({} de {})",
+                request.key.tool.as_str(),
+                request.index,
+                request.total
+            ));
+            ui.add_space(6.0);
+            for (label, value) in &rows {
+                ui.horizontal(|ui| {
+                    ui.strong(*label);
+                    ui.monospace(value);
+                });
+            }
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("Permitir una vez").clicked() {
+                    decision = Some(PermissionDecision::AllowOnce);
+                }
+                if ui.button("Permitir siempre esta ruta").clicked() {
+                    decision = Some(PermissionDecision::AllowAlways);
+                }
+                if ui.button("Rechazar").clicked() {
+                    decision = Some(PermissionDecision::Deny);
+                }
+            });
+        });
+
+        if modal.backdrop_response.clicked() {
+            decision = Some(PermissionDecision::Deny);
+        }
+        if let Some(decision) = decision {
+            self.resolve_permission(decision, ctx);
+        }
+    }
+
     fn show_chat(&mut self, ctx: &egui::Context) {
         let streaming = self.chat.rx.is_some();
+        let turn_round = self.chat.turn.as_ref().map(|turn| turn.round);
+        let busy = streaming || turn_round.is_some();
         let mut close = false;
         let mut open_settings = false;
         let mut submit = false;
@@ -951,14 +1012,16 @@ impl App {
                 ui.horizontal_centered(|ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
                     ui.strong("AI chat");
-                    let (color, hint) = if self.chat.error.is_some() {
-                        (DEL_COLOR, "error")
+                    let (color, hint): (egui::Color32, String) = if self.chat.error.is_some() {
+                        (DEL_COLOR, "error".to_owned())
+                    } else if let Some(round) = turn_round {
+                        (WARN_COLOR, format!("ronda {round}/8"))
                     } else if streaming {
-                        (WARN_COLOR, "streaming")
+                        (WARN_COLOR, "streaming".to_owned())
                     } else if self.settings.api_key.trim().is_empty() {
-                        (WARN_COLOR, "sin clave configurada")
+                        (WARN_COLOR, "sin clave configurada".to_owned())
                     } else {
-                        (ADD_COLOR, "listo")
+                        (ADD_COLOR, "listo".to_owned())
                     };
                     ui.colored_label(color, format!("● {hint}"));
                     let model = if self.settings.model.trim().is_empty() {
@@ -997,7 +1060,7 @@ impl App {
                     ui.label(error);
                 });
             }
-            if ctx.memory(|m| m.has_focus(composer_id)) && consume_plain_enter(ctx) && !streaming {
+            if ctx.memory(|m| m.has_focus(composer_id)) && consume_plain_enter(ctx) && !busy {
                 submit = true;
             }
             let composer = ui.add(
@@ -1013,14 +1076,14 @@ impl App {
                 self.chat_focus = false;
             }
             ui.horizontal(|ui| {
-                let can_send = !self.chat.input.trim().is_empty() && !streaming;
+                let can_send = !self.chat.input.trim().is_empty() && !busy;
                 if ui
                     .add_enabled(can_send, egui::Button::new("Enviar"))
                     .clicked()
                 {
                     submit = true;
                 }
-                if streaming {
+                if busy {
                     if ui.button("Cancelar").clicked() {
                         cancel = true;
                     }
@@ -1042,12 +1105,27 @@ impl App {
                 .show(ui, |ui| {
                     ui.add_space(8.0);
                     let max_width = (ui.available_width() * 0.7).max(160.0);
-                    for message in &self.chat.messages {
-                        chat_bubble(ui, message, max_width, &visuals);
-                        if message.role == Role::Assistant {
-                            for block in chat_view::code_blocks(&message.content) {
-                                if ui.small_button("Insertar en terminal").clicked() {
-                                    insert = Some(block);
+                    for (index, message) in self.chat.messages.iter().enumerate() {
+                        if message.role == Role::Tool {
+                            let id = egui::Id::new(("tool-result", index));
+                            let expanded =
+                                ui.memory(|m| m.data.get_temp::<bool>(id).unwrap_or(false));
+                            ui.horizontal(|ui| {
+                                ui.monospace(chat_view::tool_result_summary(&message.content));
+                                if ui.button(if expanded { "Ocultar" } else { "Ver" }).clicked() {
+                                    ui.memory_mut(|m| m.data.insert_temp(id, !expanded));
+                                }
+                            });
+                            if expanded {
+                                ui.monospace(message.content.as_str());
+                            }
+                        } else {
+                            chat_bubble(ui, message, max_width, &visuals);
+                            if message.role == Role::Assistant {
+                                for block in chat_view::code_blocks(&message.content) {
+                                    if ui.small_button("Insertar en terminal").clicked() {
+                                        insert = Some(block);
+                                    }
                                 }
                             }
                         }
@@ -1872,7 +1950,16 @@ impl eframe::App for App {
             ctx.request_repaint();
         }
 
-        if !self.settings_open {
+        if self
+            .chat
+            .turn
+            .as_ref()
+            .is_some_and(|turn| turn.permission.is_some())
+        {
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+                self.resolve_permission(PermissionDecision::Deny, ctx);
+            }
+        } else if !self.settings_open {
             if ctx.input_mut(|i| {
                 i.consume_key(
                     egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
@@ -1958,6 +2045,7 @@ impl eframe::App for App {
         }
 
         if self.chat_open {
+            self.show_permission(ctx);
             self.show_chat(ctx);
         } else {
             let mut inline_question = None;
@@ -2007,9 +2095,9 @@ mod tests {
     use super::{
         agent_tab_is_active, apply_permission, bang_command, build_context, classify_diff_line,
         clip_title, command_target, ctrl_backspace_bindings, files_noun, is_bare_bang,
-        matches_query, new_tool_turn, next_tool_action, tab_label, clear_tool_turn, ChatState,
-        DiffLine, PermissionDecision, PermissionKey, PermissionRequest, SettingsForm, ToolAction,
-        ToolName, ToolTurn,
+        matches_query, new_tool_turn, next_tool_action, permission_rows, tab_label,
+        clear_tool_turn, ChatState, DiffLine, PermissionDecision, PermissionKey, PermissionRequest,
+        SettingsForm, ToolAction, ToolName, ToolTurn,
     };
     use crate::tools::ToolCall;
     use egui_term::{BindingAction, InputKind};
@@ -2127,6 +2215,29 @@ mod tests {
     }
 
     #[test]
+    fn permission_rows_show_tool_path_cwd_and_reason() {
+        let req = PermissionRequest {
+            call: ToolCall {
+                id: "c1".into(),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            },
+            key: PermissionKey {
+                tool: ToolName::ReadFile,
+                path: PathBuf::from("/etc/hosts"),
+            },
+            reason: "diagnóstico".into(),
+            index: 1,
+            total: 2,
+        };
+        let rows = permission_rows(&req);
+        assert_eq!(rows[0].0, "Herramienta");
+        assert_eq!(rows[0].1, "read_file");
+        assert_eq!(rows[1].1, "/etc/hosts");
+        assert_eq!(rows[3].1, "diagnóstico");
+    }
+
+    #[test]
     fn context_respects_privacy_switch() {
         let lines = vec!["SECRETO_LINEA".to_owned()];
         let full = build_context(None, Some("/repo"), Some("SECRETO_SELECCION"), &lines, true);
@@ -2164,7 +2275,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("repterm-policy-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let cwd = std::fs::canonicalize(&root).unwrap();
-        let mut turn = ToolTurn {
+        let turn = ToolTurn {
             tab_id: 1,
             cwd: cwd.clone(),
             round: 1,
