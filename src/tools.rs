@@ -1,4 +1,5 @@
 use crate::gitinfo::expand_home;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Component, Path, PathBuf};
 
@@ -35,7 +36,7 @@ impl ToolName {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,

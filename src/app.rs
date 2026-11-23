@@ -466,7 +466,7 @@ impl App {
         self.chat.rx = Some(rx);
         let model = self.settings.model.clone();
         std::thread::spawn(move || {
-            if let Err(err) = client.stream(&model, &messages, &tx) {
+            if let Err(err) = client.stream(&model, &messages, &tx, &[]) {
                 let _ = tx.send(StreamUpdate::Error(err));
             }
         });
@@ -485,6 +485,7 @@ impl App {
         loop {
             match rx.try_recv() {
                 Ok(StreamUpdate::Delta(delta)) => self.chat.partial.push_str(&delta),
+                Ok(StreamUpdate::ToolCalls(_)) => {}
                 Ok(StreamUpdate::Done) => {
                     finished = true;
                     break;
