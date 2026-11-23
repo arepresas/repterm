@@ -178,6 +178,31 @@ fn clear_tool_turn(chat: &mut ChatState) {
     chat.turn = None;
 }
 
+/// Answers every tool call already announced to the model, keeping all
+/// `tool` messages contiguous right after the `assistant` tool-call message.
+/// Anthropic-family providers reject a `tool_use` whose `tool_result` is not
+/// in the immediately following message.
+fn push_tool_results(chat: &mut ChatState, turn: &ToolTurn, pending: &str) {
+    for outcome in &turn.outcomes {
+        chat.messages.push(ChatMessage::tool_result(
+            outcome.call_id.clone(),
+            outcome.content.clone(),
+        ));
+    }
+    for call in turn.calls.iter().skip(turn.next) {
+        chat.messages.push(ChatMessage::tool_result(
+            call.id.clone(),
+            pending.to_owned(),
+        ));
+    }
+}
+
+fn settle_tool_turn(chat: &mut ChatState, pending: &str) {
+    if let Some(turn) = chat.turn.take() {
+        push_tool_results(chat, &turn, pending);
+    }
+}
+
 fn permission_rows(request: &PermissionRequest) -> [(&'static str, String); 4] {
     [
         ("Herramienta", request.call.name.clone()),
@@ -580,6 +605,12 @@ impl App {
         if self.chat.input.trim().is_empty() || self.chat.rx.is_some() {
             return;
         }
+        // A permission dialog can leave a turn pending with no receiver. Settle
+        // it before starting another question so no tool call is left unanswered.
+        settle_tool_turn(
+            &mut self.chat,
+            "El usuario inició otra pregunta; no se ejecutó.",
+        );
         if self.settings.base_url.trim().is_empty() {
             self.chat.error = Some("Configura la Base URL en Ajustes".to_owned());
             return;
@@ -682,7 +713,10 @@ impl App {
                     self.chat.error = Some("La conexión terminó inesperadamente".to_owned());
                 }
                 if disconnected {
-                    clear_tool_turn(&mut self.chat);
+                    settle_tool_turn(
+                        &mut self.chat,
+                        "La conexión terminó antes de ejecutar esta herramienta.",
+                    );
                     self.chat.cancelled = false;
                     return;
                 }
@@ -732,26 +766,12 @@ impl App {
                 ToolAction::Finish => break,
             }
         }
-        for outcome in &turn.outcomes {
-            self.chat.messages.push(ChatMessage::tool_result(
-                outcome.call_id.clone(),
-                outcome.content.clone(),
-            ));
-            if let Some(path) = &outcome.changed_path {
-                self.chat.messages.push(ChatMessage::assistant(format!(
-                    "Archivo modificado: `{path}`"
-                )));
-            }
-        }
-        if turn.stopped {
-            if let Some(call) = turn.calls.get(turn.next) {
-                self.chat.messages.push(ChatMessage::tool_result(
-                    call.id.clone(),
-                    "El usuario denegó esta operación; no se ejecutó el resto de la ronda."
-                        .to_owned(),
-                ));
-            }
-        } else if turn.round >= MAX_TOOL_ROUNDS {
+        push_tool_results(
+            &mut self.chat,
+            &turn,
+            "El usuario denegó esta operación; no se ejecutó el resto de la ronda.",
+        );
+        if turn.round >= MAX_TOOL_ROUNDS {
             self.chat.messages.push(ChatMessage::assistant(format!(
                 "Se alcanzó el límite de {MAX_TOOL_ROUNDS} rondas de herramientas."
             )));
@@ -778,7 +798,10 @@ impl App {
     }
 
     fn cancel_chat(&mut self, ctx: &egui::Context) {
-        clear_tool_turn(&mut self.chat);
+        settle_tool_turn(
+            &mut self.chat,
+            "El usuario canceló esta herramienta; no se ejecutó.",
+        );
         let Some(rx) = self.chat.rx.take() else {
             return;
         };
@@ -2098,11 +2121,12 @@ mod tests {
     use super::{
         agent_tab_is_active, apply_permission, bang_command, build_context, classify_diff_line,
         clear_tool_turn, clip_title, command_target, ctrl_backspace_bindings, files_noun,
-        is_bare_bang, matches_query, new_tool_turn, next_tool_action, permission_rows, tab_label,
-        ChatState, DiffLine, PermissionDecision, PermissionKey, PermissionRequest, SettingsForm,
-        ToolAction, ToolName, ToolTurn,
+        is_bare_bang, matches_query, new_tool_turn, next_tool_action, permission_rows,
+        push_tool_results, tab_label, ChatState, DiffLine, PermissionDecision, PermissionKey,
+        PermissionRequest, SettingsForm, ToolAction, ToolName, ToolTurn,
     };
-    use crate::tools::ToolCall;
+    use crate::llm::{ChatMessage, Role};
+    use crate::tools::{ToolCall, ToolOutcome};
     use egui_term::{BindingAction, InputKind};
     use std::collections::HashSet;
     use std::path::PathBuf;
@@ -2382,5 +2406,97 @@ mod tests {
         clear_tool_turn(&mut chat);
         assert!(chat.turn.is_none());
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    fn sample_turn() -> (ToolTurn, Vec<ToolCall>) {
+        let calls = (1..=3)
+            .map(|n| ToolCall {
+                id: format!("c{n}"),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            })
+            .collect::<Vec<_>>();
+        let turn = ToolTurn {
+            tab_id: 1,
+            cwd: PathBuf::from("/tmp"),
+            round: 1,
+            calls: calls.clone(),
+            outcomes: vec![ToolOutcome {
+                call_id: "c1".into(),
+                content: "contenido".into(),
+                changed_path: None,
+            }],
+            next: 1,
+            permission: None,
+            stopped: true,
+        };
+        (turn, calls)
+    }
+
+    #[test]
+    fn settling_turn_answers_announced_calls() {
+        let (turn, calls) = sample_turn();
+        let mut chat = ChatState::new();
+        chat.messages.push(ChatMessage::assistant_tool_calls(calls));
+        chat.turn = Some(turn);
+        super::settle_tool_turn(&mut chat, "cancelado");
+        assert!(chat.turn.is_none());
+        assert_eq!(
+            chat.messages
+                .iter()
+                .filter(|message| message.role == Role::Tool)
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn tool_results_are_contiguous_with_no_assistant_notes() {
+        let (turn, calls) = sample_turn();
+        let mut chat = ChatState::new();
+        chat.messages.push(ChatMessage::assistant_tool_calls(calls));
+        push_tool_results(&mut chat, &turn, "denegado");
+        let roles = chat
+            .messages
+            .iter()
+            .map(|message| message.role)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            roles,
+            vec![Role::Assistant, Role::Tool, Role::Tool, Role::Tool]
+        );
+    }
+
+    #[test]
+    fn denial_answers_every_remaining_call() {
+        let (turn, _) = sample_turn();
+        let mut chat = ChatState::new();
+        push_tool_results(&mut chat, &turn, "denegado");
+        let ids = chat
+            .messages
+            .iter()
+            .filter(|message| message.role == Role::Tool)
+            .map(|message| message.tool_call_id.clone().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["c1", "c2", "c3"]);
+        assert!(chat
+            .messages
+            .iter()
+            .all(|message| message.role == Role::Tool));
+    }
+
+    #[test]
+    fn build_messages_keeps_contiguous_results_as_one_unit() {
+        let (turn, calls) = sample_turn();
+        let mut chat = ChatState::new();
+        chat.messages.push(ChatMessage::assistant_tool_calls(calls));
+        push_tool_results(&mut chat, &turn, "denegado");
+        chat.messages
+            .push(ChatMessage::assistant("texto posterior"));
+        let built = crate::llm::build_messages("ctx", &chat.messages);
+        assert_eq!(built[1].role, Role::Assistant);
+        assert!(built[1].tool_calls.is_some());
+        assert!(built[2..5].iter().all(|message| message.role == Role::Tool));
+        assert_eq!(built[5].role, Role::Assistant);
     }
 }
