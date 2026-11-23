@@ -7,12 +7,17 @@ use crate::gitinfo::{
 use crate::llm::{build_messages, ChatMessage, LlmClient, Role, StreamUpdate};
 use crate::settings::{self, Settings};
 use crate::tabs::Tabs;
+use crate::tools::{
+    execute, is_within, tool_definitions, PermissionKey, ToolCall, ToolName, ToolOutcome,
+};
 use alacritty_terminal::event::WindowSize;
 use alacritty_terminal::term::ClipboardType;
 use alacritty_terminal::vte::ansi::Rgb;
 use egui_term::{
     BackendCommand, Binding, BindingAction, InputKind, TerminalBackend, TerminalMode, TerminalView,
 };
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
@@ -26,8 +31,41 @@ const DEL_COLOR: egui::Color32 = egui::Color32::from_rgb(0xe0, 0x6c, 0x6c);
 const WARN_COLOR: egui::Color32 = egui::Color32::from_rgb(0xd9, 0xa4, 0x41);
 const MAX_TERMINAL_CONTEXT_CHARS: usize = 8000;
 const MAX_CONTEXT_LINES: usize = 120;
+const MAX_TOOL_ROUNDS: usize = 8;
 
 type DiffKey = (String, String, bool, u32, u32);
+
+pub struct PermissionRequest {
+    pub call: ToolCall,
+    pub key: PermissionKey,
+    pub reason: String,
+    pub index: usize,
+    pub total: usize,
+}
+
+pub struct ToolTurn {
+    pub tab_id: u64,
+    pub cwd: PathBuf,
+    pub round: usize,
+    pub calls: Vec<ToolCall>,
+    pub outcomes: Vec<ToolOutcome>,
+    pub next: usize,
+    pub permission: Option<PermissionRequest>,
+    pub stopped: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PermissionDecision {
+    AllowOnce,
+    AllowAlways,
+    Deny,
+}
+
+pub enum ToolAction {
+    Execute(ToolCall),
+    Ask(PermissionRequest),
+    Finish,
+}
 
 pub struct ChatState {
     pub messages: Vec<ChatMessage>,
@@ -37,6 +75,7 @@ pub struct ChatState {
     pub cancelled: bool,
     pub cancel: Arc<AtomicBool>,
     pub rx: Option<Receiver<StreamUpdate>>,
+    pub turn: Option<ToolTurn>,
 }
 
 impl ChatState {
@@ -49,8 +88,97 @@ impl ChatState {
             cancelled: false,
             cancel: Arc::new(AtomicBool::new(false)),
             rx: None,
+            turn: None,
         }
     }
+}
+
+fn new_tool_turn(tab_id: Option<u64>, cwd: Option<&str>) -> Result<ToolTurn, String> {
+    let tab_id = tab_id.ok_or_else(|| "No hay pestaña activa para ejecutar herramientas".to_owned())?;
+    let raw = cwd.ok_or_else(|| "No se conoce el directorio de la pestaña activa".to_owned())?;
+    let cwd = std::fs::canonicalize(raw)
+        .map_err(|err| format!("No se pudo resolver el directorio activo: {err}"))?;
+    Ok(ToolTurn {
+        tab_id,
+        cwd,
+        round: 1,
+        calls: Vec::new(),
+        outcomes: Vec::new(),
+        next: 0,
+        permission: None,
+        stopped: false,
+    })
+}
+
+fn call_path(call: &ToolCall) -> Option<String> {
+    let args: serde_json::Value = serde_json::from_str(&call.arguments).ok()?;
+    args.get("path")?.as_str().map(str::to_owned)
+}
+
+fn call_reason(call: &ToolCall) -> String {
+    serde_json::from_str::<serde_json::Value>(&call.arguments)
+        .ok()
+        .and_then(|value| value.get("reason")?.as_str().map(str::to_owned))
+        .unwrap_or_default()
+}
+
+fn next_tool_action(turn: &ToolTurn, allowed: &HashSet<PermissionKey>) -> ToolAction {
+    if turn.stopped {
+        return ToolAction::Finish;
+    }
+    let Some(call) = turn.calls.get(turn.next) else {
+        return ToolAction::Finish;
+    };
+    let path = match call_path(call).and_then(|raw| {
+        crate::tools::resolve_path(
+            &raw,
+            &turn.cwd,
+            std::env::var("HOME").ok().as_deref(),
+        )
+        .ok()
+    }) {
+        Some(path) => path,
+        None => return ToolAction::Execute(call.clone()),
+    };
+    let tool = ToolName::from_str(&call.name).unwrap_or(ToolName::ReadFile);
+    let key = PermissionKey {
+        tool,
+        path: path.clone(),
+    };
+    if is_within(&path, &turn.cwd) || allowed.contains(&key) {
+        ToolAction::Execute(call.clone())
+    } else {
+        ToolAction::Ask(PermissionRequest {
+            call: call.clone(),
+            key,
+            reason: call_reason(call),
+            index: turn.next + 1,
+            total: turn.calls.len(),
+        })
+    }
+}
+
+fn apply_permission(
+    turn: &mut ToolTurn,
+    allowed: &mut HashSet<PermissionKey>,
+    decision: PermissionDecision,
+) {
+    let Some(request) = turn.permission.take() else {
+        return;
+    };
+    match decision {
+        PermissionDecision::AllowOnce => {}
+        PermissionDecision::AllowAlways => {
+            allowed.insert(request.key);
+        }
+        PermissionDecision::Deny => {
+            turn.stopped = true;
+        }
+    }
+}
+
+fn clear_tool_turn(chat: &mut ChatState) {
+    chat.turn = None;
 }
 
 #[derive(Clone)]
@@ -138,6 +266,7 @@ pub struct App {
     model_list: Option<Vec<String>>,
     model_error: Option<String>,
     models_loading: bool,
+    allowed_tools: HashSet<PermissionKey>,
 }
 
 impl App {
@@ -184,6 +313,7 @@ impl App {
             model_list: None,
             model_error: None,
             models_loading: false,
+            allowed_tools: HashSet::new(),
         })
     }
 
@@ -383,6 +513,9 @@ impl App {
     }
 
     fn close_chat(&mut self, ctx: &egui::Context) {
+        if self.chat.turn.is_some() || self.chat.rx.is_some() {
+            self.cancel_chat(ctx);
+        }
         self.chat_open = false;
         self.chat_focus = false;
         ctx.memory_mut(|m| m.surrender_focus(chat_composer_id()));
@@ -449,11 +582,27 @@ impl App {
             self.chat.error = Some("Configura un modelo en Ajustes".to_owned());
             return;
         }
+        let turn = match new_tool_turn(self.tabs.active(), self.active_cwd().as_deref()) {
+            Ok(turn) => turn,
+            Err(err) => {
+                self.chat.error = Some(err);
+                return;
+            }
+        };
         let input = std::mem::take(&mut self.chat.input);
         self.chat.messages.push(ChatMessage::user(input.trim()));
         self.chat.partial.clear();
         self.chat.error = None;
         self.chat.cancelled = false;
+        self.chat.turn = Some(turn);
+        self.spawn_chat_request(ctx);
+        if focus_composer {
+            self.chat_focus = true;
+        }
+        ctx.request_repaint();
+    }
+
+    fn spawn_chat_request(&mut self, ctx: &egui::Context) {
         let context = self.chat_context();
         let messages = build_messages(&context, &self.chat.messages);
         let client = LlmClient {
@@ -465,14 +614,12 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel();
         self.chat.rx = Some(rx);
         let model = self.settings.model.clone();
+        let tools = tool_definitions();
         std::thread::spawn(move || {
-            if let Err(err) = client.stream(&model, &messages, &tx, &[]) {
+            if let Err(err) = client.stream(&model, &messages, &tx, &tools) {
                 let _ = tx.send(StreamUpdate::Error(err));
             }
         });
-        if focus_composer {
-            self.chat_focus = true;
-        }
         ctx.request_repaint();
     }
 
@@ -482,10 +629,11 @@ impl App {
         };
         let mut finished = false;
         let mut disconnected = false;
+        let mut tool_calls: Option<Vec<ToolCall>> = None;
         loop {
             match rx.try_recv() {
                 Ok(StreamUpdate::Delta(delta)) => self.chat.partial.push_str(&delta),
-                Ok(StreamUpdate::ToolCalls(_)) => {}
+                Ok(StreamUpdate::ToolCalls(calls)) => tool_calls = Some(calls),
                 Ok(StreamUpdate::Done) => {
                     finished = true;
                     break;
@@ -502,7 +650,37 @@ impl App {
                 }
             }
         }
+        if let Some(calls) = tool_calls {
+            if let Some(turn) = self.chat.turn.as_mut() {
+                turn.calls = calls;
+            }
+        }
         if finished || disconnected {
+            let has_calls = self
+                .chat
+                .turn
+                .as_ref()
+                .is_some_and(|turn| !turn.calls.is_empty());
+            if finished && has_calls {
+                let calls = self
+                    .chat
+                    .turn
+                    .as_ref()
+                    .map(|turn| turn.calls.clone())
+                    .unwrap_or_default();
+                self.chat.messages.push(ChatMessage::assistant_tool_calls(calls));
+                self.chat.partial.clear();
+                if disconnected && self.chat.error.is_none() {
+                    self.chat.error = Some("La conexión terminó inesperadamente".to_owned());
+                }
+                if disconnected {
+                    clear_tool_turn(&mut self.chat);
+                    self.chat.cancelled = false;
+                    return;
+                }
+                self.advance_tools(ctx);
+                return;
+            }
             if !self.chat.partial.is_empty() {
                 let partial = std::mem::take(&mut self.chat.partial);
                 self.chat.messages.push(ChatMessage::assistant(partial));
@@ -511,13 +689,91 @@ impl App {
                 self.chat.error = Some("La conexión terminó inesperadamente".to_owned());
             }
             self.chat.cancelled = false;
+            clear_tool_turn(&mut self.chat);
         } else {
             self.chat.rx = Some(rx);
             ctx.request_repaint();
         }
     }
 
+    fn advance_tools(&mut self, ctx: &egui::Context) {
+        let Some(mut turn) = self.chat.turn.take() else {
+            return;
+        };
+        loop {
+            if turn.next >= turn.calls.len() {
+                break;
+            }
+            match next_tool_action(&turn, &self.allowed_tools) {
+                ToolAction::Execute(call) => {
+                    let outcome = execute(
+                        &call,
+                        &turn.cwd,
+                        std::env::var("HOME").ok().as_deref(),
+                    )
+                    .unwrap_or_else(|err| ToolOutcome {
+                        call_id: call.id.clone(),
+                        content: format!("Error: {err}"),
+                        changed_path: None,
+                    });
+                    turn.outcomes.push(outcome);
+                    turn.next += 1;
+                }
+                ToolAction::Ask(request) => {
+                    turn.permission = Some(request);
+                    self.chat.turn = Some(turn);
+                    ctx.request_repaint();
+                    return;
+                }
+                ToolAction::Finish => break,
+            }
+        }
+        for outcome in &turn.outcomes {
+            self.chat
+                .messages
+                .push(ChatMessage::tool_result(outcome.call_id.clone(), outcome.content.clone()));
+            if let Some(path) = &outcome.changed_path {
+                self.chat
+                    .messages
+                    .push(ChatMessage::assistant(format!("Archivo modificado: `{path}`")));
+            }
+        }
+        if turn.stopped {
+            if let Some(call) = turn.calls.get(turn.next) {
+                self.chat.messages.push(ChatMessage::tool_result(
+                    call.id.clone(),
+                    "El usuario denegó esta operación; no se ejecutó el resto de la ronda."
+                        .to_owned(),
+                ));
+            }
+        } else if turn.round >= MAX_TOOL_ROUNDS {
+            self.chat.messages.push(ChatMessage::assistant(format!(
+                "Se alcanzó el límite de {MAX_TOOL_ROUNDS} rondas de herramientas."
+            )));
+            return;
+        }
+        turn.round += 1;
+        turn.calls.clear();
+        turn.outcomes.clear();
+        turn.next = 0;
+        turn.permission = None;
+        turn.stopped = false;
+        self.chat.turn = Some(turn);
+        self.spawn_chat_request(ctx);
+    }
+
+    fn resolve_permission(&mut self, decision: PermissionDecision, ctx: &egui::Context) {
+        {
+            let Some(turn) = self.chat.turn.as_mut() else {
+                return;
+            };
+            apply_permission(turn, &mut self.allowed_tools, decision);
+        }
+        self.advance_tools(ctx);
+    }
+
     fn cancel_chat(&mut self, ctx: &egui::Context) {
+        clear_tool_turn(&mut self.chat);
         let Some(rx) = self.chat.rx.take() else {
             return;
         };
@@ -1749,11 +2005,16 @@ fn agent_tab_is_active(active: Option<u64>, agent_tab: Option<u64>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_tab_is_active, bang_command, build_context, classify_diff_line, clip_title, command_target,
-        ctrl_backspace_bindings, files_noun, is_bare_bang, matches_query, tab_label, DiffLine,
-        SettingsForm,
+        agent_tab_is_active, apply_permission, bang_command, build_context, classify_diff_line,
+        clip_title, command_target, ctrl_backspace_bindings, files_noun, is_bare_bang,
+        matches_query, new_tool_turn, next_tool_action, tab_label, clear_tool_turn, ChatState,
+        DiffLine, PermissionDecision, PermissionKey, PermissionRequest, SettingsForm, ToolAction,
+        ToolName, ToolTurn,
     };
+    use crate::tools::ToolCall;
     use egui_term::{BindingAction, InputKind};
+    use std::collections::HashSet;
+    use std::path::PathBuf;
 
     #[test]
     fn agent_mode_is_only_active_on_its_originating_tab() {
@@ -1879,5 +2140,130 @@ mod tests {
         assert!(full.contains("SECRETO_LINEA") && full.contains("SECRETO_SELECCION"));
         assert!(redacted.contains("/repo"));
         assert!(!redacted.contains("SECRETO_LINEA") && !redacted.contains("SECRETO_SELECCION"));
+    }
+
+    #[test]
+    fn new_tool_turn_requires_active_cwd() {
+        assert!(new_tool_turn(None, None).is_err());
+        assert!(new_tool_turn(Some(1), None).is_err());
+    }
+
+    #[test]
+    fn new_tool_turn_snapshots_tab_and_cwd() {
+        let root = std::env::temp_dir().join(format!("repterm-turn-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let turn = new_tool_turn(Some(7), root.to_str()).unwrap();
+        assert_eq!(turn.tab_id, 7);
+        assert_eq!(turn.cwd, std::fs::canonicalize(&root).unwrap());
+        assert_eq!(turn.round, 1);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn next_tool_action_asks_outside_and_executes_allowed() {
+        let root = std::env::temp_dir().join(format!("repterm-policy-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let cwd = std::fs::canonicalize(&root).unwrap();
+        let mut turn = ToolTurn {
+            tab_id: 1,
+            cwd: cwd.clone(),
+            round: 1,
+            calls: vec![ToolCall {
+                id: "c1".into(),
+                name: "read_file".into(),
+                arguments: r#"{"path":"/etc/hosts","reason":"diagnóstico"}"#.into(),
+            }],
+            outcomes: vec![],
+            next: 0,
+            permission: None,
+            stopped: false,
+        };
+        let mut allowed = HashSet::new();
+        assert!(matches!(
+            next_tool_action(&turn, &allowed),
+            ToolAction::Ask(_)
+        ));
+        let tool = ToolName::from_str("read_file").unwrap();
+        allowed.insert(PermissionKey {
+            tool,
+            path: PathBuf::from("/etc/hosts"),
+        });
+        assert!(matches!(
+            next_tool_action(&turn, &allowed),
+            ToolAction::Execute(_)
+        ));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn denial_stops_remaining_calls() {
+        let root = std::env::temp_dir().join(format!("repterm-deny-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let cwd = std::fs::canonicalize(&root).unwrap();
+        let call = |id: &str| ToolCall {
+            id: id.into(),
+            name: "read_file".into(),
+            arguments: r#"{"path":"/etc/hosts","reason":" diagnóstico"}"#.into(),
+        };
+        let mut turn = ToolTurn {
+            tab_id: 1,
+            cwd,
+            round: 1,
+            calls: vec![call("a"), call("b"), call("c")],
+            outcomes: vec![],
+            next: 0,
+            permission: Some(PermissionRequest {
+                call: call("a"),
+                key: PermissionKey {
+                    tool: ToolName::ReadFile,
+                    path: PathBuf::from("/etc/hosts"),
+                },
+                reason: "diagnóstico".into(),
+                index: 1,
+                total: 3,
+            }),
+            stopped: false,
+        };
+        let mut allowed = HashSet::new();
+        apply_permission(&mut turn, &mut allowed, PermissionDecision::Deny);
+        turn.stopped = true;
+        assert!(turn.permission.is_none());
+        assert!(allowed.is_empty());
+        assert!(matches!(next_tool_action(&turn, &allowed), ToolAction::Finish));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn cancel_turn_clears_permission() {
+        let mut chat = ChatState::new();
+        let root = std::env::temp_dir().join(format!("repterm-cancel-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let cwd = std::fs::canonicalize(&root).unwrap();
+        chat.turn = Some(ToolTurn {
+            tab_id: 1,
+            cwd,
+            round: 1,
+            calls: vec![],
+            outcomes: vec![],
+            next: 0,
+            permission: Some(PermissionRequest {
+                call: ToolCall {
+                    id: "x".into(),
+                    name: "read_file".into(),
+                    arguments: "{}".into(),
+                },
+                key: PermissionKey {
+                    tool: ToolName::ReadFile,
+                    path: PathBuf::from("/etc/hosts"),
+                },
+                reason: "r".into(),
+                index: 1,
+                total: 1,
+            }),
+            stopped: false,
+        });
+        clear_tool_turn(&mut chat);
+        assert!(chat.turn.is_none());
+        std::fs::remove_dir_all(&root).ok();
     }
 }
