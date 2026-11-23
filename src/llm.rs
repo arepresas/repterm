@@ -296,13 +296,12 @@ impl LlmClient {
 
             for frame in frames {
                 if frame.trim() == "[DONE]" {
-                    if tool_fragments.is_empty() {
-                        let _ = tx.send(StreamUpdate::Done);
-                    } else {
+                    if !tool_fragments.is_empty() {
                         let _ = tx.send(StreamUpdate::ToolCalls(aggregate_tool_calls(
                             &tool_fragments,
                         )));
                     }
+                    let _ = tx.send(StreamUpdate::Done);
                     return Ok(());
                 }
                 match parse_tool_call_delta(&frame) {
@@ -319,13 +318,12 @@ impl LlmClient {
             }
         }
 
-        if tool_fragments.is_empty() {
-            let _ = tx.send(StreamUpdate::Done);
-        } else {
+        if !tool_fragments.is_empty() {
             let _ = tx.send(StreamUpdate::ToolCalls(aggregate_tool_calls(
                 &tool_fragments,
             )));
         }
+        let _ = tx.send(StreamUpdate::Done);
         Ok(())
     }
 }
@@ -523,6 +521,54 @@ mod tests {
         );
         assert_eq!(parse_delta("[DONE]").unwrap(), None);
         assert!(parse_delta("{\"error\":{\"message\":\"boom\"}}").is_err());
+    }
+
+    #[test]
+    fn stream_sends_done_after_tool_calls() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = conn.read(&mut request).unwrap();
+            let response = concat!(
+                "HTTP/1.1 200 OK\r\n",
+                "Content-Type: text/event-stream\r\n",
+                "Connection: close\r\n\r\n",
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{}\"}}]}}]}\n\n",
+                "data: [DONE]\n\n"
+            );
+            conn.write_all(response.as_bytes()).unwrap();
+        });
+
+        let client = LlmClient {
+            base_url: format!("http://{addr}/v1"),
+            api_key: "test".into(),
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        let (tx, rx) = mpsc::channel();
+        let messages = [ChatMessage::user("hola")];
+        client
+            .stream("model", &messages, &tx, &tool_definitions())
+            .unwrap();
+        server.join().unwrap();
+        drop(tx);
+
+        let updates: Vec<_> = rx.iter().collect();
+        assert!(
+            updates
+                .iter()
+                .any(|update| matches!(update, StreamUpdate::ToolCalls(_))),
+            "updates: {updates:?}"
+        );
+        assert!(
+            matches!(updates.last(), Some(StreamUpdate::Done)),
+            "tool-call streams must still end with Done; updates: {updates:?}"
+        );
     }
 
     #[test]
