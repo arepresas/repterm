@@ -123,6 +123,7 @@ pub struct App {
     diff_rx: std::sync::mpsc::Receiver<(DiffKey, Vec<String>)>,
     chat_open: bool,
     chat: ChatState,
+    chat_focus: bool,
     settings: Settings,
     settings_open: bool,
     settings_form: SettingsForm,
@@ -168,6 +169,7 @@ impl App {
             diff_rx,
             chat_open: false,
             chat: ChatState::new(),
+            chat_focus: false,
             settings: settings.clone(),
             settings_open: false,
             settings_form: SettingsForm::from_settings(&settings),
@@ -374,14 +376,15 @@ impl App {
 
     fn open_chat(&mut self, ctx: &egui::Context) {
         self.chat_open = true;
+        self.chat_focus = true;
         self.inline_agent_open = false;
         self.picker = None;
-        ctx.memory_mut(|m| m.request_focus(chat_composer_id()));
         ctx.request_repaint();
     }
 
     fn close_chat(&mut self, ctx: &egui::Context) {
         self.chat_open = false;
+        self.chat_focus = false;
         ctx.memory_mut(|m| m.surrender_focus(chat_composer_id()));
         ctx.request_repaint();
     }
@@ -468,7 +471,7 @@ impl App {
             }
         });
         if focus_composer {
-            ctx.memory_mut(|m| m.request_focus(chat_composer_id()));
+            self.chat_focus = true;
         }
         ctx.request_repaint();
     }
@@ -740,7 +743,7 @@ impl App {
             if ctx.memory(|m| m.has_focus(composer_id)) && consume_plain_enter(ctx) && !streaming {
                 submit = true;
             }
-            ui.add(
+            let composer = ui.add(
                 egui::TextEdit::multiline(&mut self.chat.input)
                     .id(composer_id)
                     .font(egui::TextStyle::Monospace)
@@ -748,6 +751,10 @@ impl App {
                     .desired_width(f32::INFINITY)
                     .hint_text("Pregunta al agente o escribe !comando"),
             );
+            if self.chat_focus {
+                composer.request_focus();
+                self.chat_focus = false;
+            }
             ui.horizontal(|ui| {
                 let can_send = !self.chat.input.trim().is_empty() && !streaming;
                 if ui
@@ -831,8 +838,8 @@ impl App {
         }
         if open_settings {
             self.open_settings(ctx);
-        } else if self.chat_open && !had_insert && !close {
-            ctx.memory_mut(|m| m.request_focus(composer_id));
+        } else if self.chat_open && !had_insert && !close && !ctx.memory(|m| m.has_focus(composer_id)) {
+            self.chat_focus = true;
         }
     }
 
