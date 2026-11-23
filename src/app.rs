@@ -1303,7 +1303,7 @@ fn files_noun(count: usize) -> &'static str {
 }
 
 fn chat_composer_id() -> egui::Id {
-    egui::Id::new("chat_composer")
+    egui::Id::new("chat_composer_input")
 }
 
 fn blink(ui: &egui::Ui) -> bool {
