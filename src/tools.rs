@@ -201,7 +201,8 @@ fn write_file(path: &Path, content: &str) -> Result<(), String> {
         ));
     }
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("No se pudo crear el directorio: {e}"))?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("No se pudo crear el directorio: {e}"))?;
     }
     std::fs::write(path, content).map_err(|e| format!("No se pudo escribir: {e}"))
 }
@@ -233,7 +234,9 @@ fn list_dir(path: &Path) -> Result<String, String> {
     for entry in std::fs::read_dir(path).map_err(|e| format!("No se pudo listar: {e}"))? {
         let entry = entry.map_err(|e| format!("No se pudo listar: {e}"))?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        let metadata = entry.metadata().map_err(|e| format!("No se pudo listar: {e}"))?;
+        let metadata = entry
+            .metadata()
+            .map_err(|e| format!("No se pudo listar: {e}"))?;
         if metadata.is_dir() {
             entries.push(format!("{name}/"));
         } else {
@@ -245,7 +248,9 @@ fn list_dir(path: &Path) -> Result<String, String> {
     entries.truncate(MAX_LIST_ENTRIES);
     let mut content = entries.join("\n");
     if total > MAX_LIST_ENTRIES {
-        content.push_str(&format!("\n[recortado a {MAX_LIST_ENTRIES} de {total} entradas]"));
+        content.push_str(&format!(
+            "\n[recortado a {MAX_LIST_ENTRIES} de {total} entradas]"
+        ));
     }
     Ok(content)
 }
@@ -254,7 +259,8 @@ pub fn execute(call: &ToolCall, cwd: &Path, home: Option<&str>) -> Result<ToolOu
     let args: Value = serde_json::from_str(&call.arguments)
         .map_err(|e| format!("Argumentos JSON inválidos: {e}"))?;
     string_field(&args, "reason")?;
-    ToolName::from_str(&call.name).ok_or_else(|| format!("Herramienta desconocida: {}", call.name))?;
+    ToolName::from_str(&call.name)
+        .ok_or_else(|| format!("Herramienta desconocida: {}", call.name))?;
     let raw = string_field(&args, "path")?;
     let path = resolve_path(&raw, cwd, home)?;
     let (content, changed_path) = match call.name.as_str() {
@@ -263,13 +269,19 @@ pub fn execute(call: &ToolCall, cwd: &Path, home: Option<&str>) -> Result<ToolOu
         "write_file" => {
             let content = string_field(&args, "content")?;
             write_file(&path, &content)?;
-            (format!("Archivo escrito: {raw}"), Some(relative_path(&path, cwd)))
+            (
+                format!("Archivo escrito: {raw}"),
+                Some(relative_path(&path, cwd)),
+            )
         }
         "edit_file" => {
             let old = string_field(&args, "old")?;
             let new = string_field(&args, "new")?;
             edit_file(&path, &old, &new)?;
-            (format!("Archivo modificado: {raw}"), Some(relative_path(&path, cwd)))
+            (
+                format!("Archivo modificado: {raw}"),
+                Some(relative_path(&path, cwd)),
+            )
         }
         _ => return Err(format!("Herramienta desconocida: {}", call.name)),
     };
@@ -378,7 +390,10 @@ mod tests {
             .iter()
             .map(|d| d["function"]["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names, vec!["list_dir", "read_file", "write_file", "edit_file"]);
+        assert_eq!(
+            names,
+            vec!["list_dir", "read_file", "write_file", "edit_file"]
+        );
         for def in &defs {
             let required = def["function"]["parameters"]["required"]
                 .as_array()

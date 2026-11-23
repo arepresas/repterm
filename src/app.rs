@@ -95,7 +95,8 @@ impl ChatState {
 }
 
 fn new_tool_turn(tab_id: Option<u64>, cwd: Option<&str>) -> Result<ToolTurn, String> {
-    let tab_id = tab_id.ok_or_else(|| "No hay pestaña activa para ejecutar herramientas".to_owned())?;
+    let tab_id =
+        tab_id.ok_or_else(|| "No hay pestaña activa para ejecutar herramientas".to_owned())?;
     let raw = cwd.ok_or_else(|| "No se conoce el directorio de la pestaña activa".to_owned())?;
     let cwd = std::fs::canonicalize(raw)
         .map_err(|err| format!("No se pudo resolver el directorio activo: {err}"))?;
@@ -131,12 +132,7 @@ fn next_tool_action(turn: &ToolTurn, allowed: &HashSet<PermissionKey>) -> ToolAc
         return ToolAction::Finish;
     };
     let path = match call_path(call).and_then(|raw| {
-        crate::tools::resolve_path(
-            &raw,
-            &turn.cwd,
-            std::env::var("HOME").ok().as_deref(),
-        )
-        .ok()
+        crate::tools::resolve_path(&raw, &turn.cwd, std::env::var("HOME").ok().as_deref()).ok()
     }) {
         Some(path) => path,
         None => return ToolAction::Execute(call.clone()),
@@ -678,7 +674,9 @@ impl App {
                     .as_ref()
                     .map(|turn| turn.calls.clone())
                     .unwrap_or_default();
-                self.chat.messages.push(ChatMessage::assistant_tool_calls(calls));
+                self.chat
+                    .messages
+                    .push(ChatMessage::assistant_tool_calls(calls));
                 self.chat.partial.clear();
                 if disconnected && self.chat.error.is_none() {
                     self.chat.error = Some("La conexión terminó inesperadamente".to_owned());
@@ -716,16 +714,12 @@ impl App {
             }
             match next_tool_action(&turn, &self.allowed_tools) {
                 ToolAction::Execute(call) => {
-                    let outcome = execute(
-                        &call,
-                        &turn.cwd,
-                        std::env::var("HOME").ok().as_deref(),
-                    )
-                    .unwrap_or_else(|err| ToolOutcome {
-                        call_id: call.id.clone(),
-                        content: format!("Error: {err}"),
-                        changed_path: None,
-                    });
+                    let outcome = execute(&call, &turn.cwd, std::env::var("HOME").ok().as_deref())
+                        .unwrap_or_else(|err| ToolOutcome {
+                            call_id: call.id.clone(),
+                            content: format!("Error: {err}"),
+                            changed_path: None,
+                        });
                     turn.outcomes.push(outcome);
                     turn.next += 1;
                 }
@@ -739,13 +733,14 @@ impl App {
             }
         }
         for outcome in &turn.outcomes {
-            self.chat
-                .messages
-                .push(ChatMessage::tool_result(outcome.call_id.clone(), outcome.content.clone()));
+            self.chat.messages.push(ChatMessage::tool_result(
+                outcome.call_id.clone(),
+                outcome.content.clone(),
+            ));
             if let Some(path) = &outcome.changed_path {
-                self.chat
-                    .messages
-                    .push(ChatMessage::assistant(format!("Archivo modificado: `{path}`")));
+                self.chat.messages.push(ChatMessage::assistant(format!(
+                    "Archivo modificado: `{path}`"
+                )));
             }
         }
         if turn.stopped {
@@ -819,7 +814,11 @@ impl App {
     }
 
     fn submit_inline_question(&mut self, typed: &str, ctx: &egui::Context) {
-        let question = typed.trim().strip_prefix('!').unwrap_or(typed.trim()).trim();
+        let question = typed
+            .trim()
+            .strip_prefix('!')
+            .unwrap_or(typed.trim())
+            .trim();
         if question.is_empty() {
             return;
         }
@@ -860,7 +859,8 @@ impl App {
             output.push_str("\r\n");
         }
         if let Some(tab) = self.agent_tab.and_then(|id| self.tabs.tab_mut(id)) {
-            tab.backend.inject_output_preserving_prompt(output.as_bytes());
+            tab.backend
+                .inject_output_preserving_prompt(output.as_bytes());
         }
         self.agent_output_committed = true;
         self.inline_agent_open = false;
@@ -960,8 +960,9 @@ impl App {
         let modal = egui::Modal::new(egui::Id::new("repterm-tool-permission")).show(ctx, |ui| {
             ui.set_width(420.0);
             ui.strong(format!(
-                "Permiso solicitado: {} ({} de {})",
+                "Permiso solicitado: {} (pestaña {}, {} de {})",
                 request.key.tool.as_str(),
+                turn.tab_id,
                 request.index,
                 request.total
             ));
@@ -1173,7 +1174,11 @@ impl App {
         }
         if open_settings {
             self.open_settings(ctx);
-        } else if self.chat_open && !had_insert && !close && !ctx.memory(|m| m.has_focus(composer_id)) {
+        } else if self.chat_open
+            && !had_insert
+            && !close
+            && !ctx.memory(|m| m.has_focus(composer_id))
+        {
             self.chat_focus = true;
         }
     }
@@ -2060,9 +2065,7 @@ impl eframe::App for App {
                 if let Some(tab) = self.tabs.active_tab_mut() {
                     let size = ui.available_size();
                     let terminal = TerminalView::new(ui, &mut tab.backend)
-                        .set_focus(
-                            !self.chat_open && !self.settings_open && self.picker.is_none(),
-                        )
+                        .set_focus(!self.chat_open && !self.settings_open && self.picker.is_none())
                         .set_size(size)
                         .set_bang_submit(&mut inline_question)
                         .set_bang_draft(&mut bang_draft)
@@ -2094,10 +2097,10 @@ fn agent_tab_is_active(active: Option<u64>, agent_tab: Option<u64>) -> bool {
 mod tests {
     use super::{
         agent_tab_is_active, apply_permission, bang_command, build_context, classify_diff_line,
-        clip_title, command_target, ctrl_backspace_bindings, files_noun, is_bare_bang,
-        matches_query, new_tool_turn, next_tool_action, permission_rows, tab_label,
-        clear_tool_turn, ChatState, DiffLine, PermissionDecision, PermissionKey, PermissionRequest,
-        SettingsForm, ToolAction, ToolName, ToolTurn,
+        clear_tool_turn, clip_title, command_target, ctrl_backspace_bindings, files_noun,
+        is_bare_bang, matches_query, new_tool_turn, next_tool_action, permission_rows, tab_label,
+        ChatState, DiffLine, PermissionDecision, PermissionKey, PermissionRequest, SettingsForm,
+        ToolAction, ToolName, ToolTurn,
     };
     use crate::tools::ToolCall;
     use egui_term::{BindingAction, InputKind};
@@ -2340,7 +2343,10 @@ mod tests {
         turn.stopped = true;
         assert!(turn.permission.is_none());
         assert!(allowed.is_empty());
-        assert!(matches!(next_tool_action(&turn, &allowed), ToolAction::Finish));
+        assert!(matches!(
+            next_tool_action(&turn, &allowed),
+            ToolAction::Finish
+        ));
         std::fs::remove_dir_all(&root).ok();
     }
 

@@ -33,7 +33,12 @@ pub enum Role {
 pub struct ChatMessage {
     pub role: Role,
     pub content: String,
-    #[serde(default, skip_serializing_if = "Option::is_none", serialize_with = "serialize_tool_calls", deserialize_with = "deserialize_tool_calls")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_tool_calls",
+        deserialize_with = "deserialize_tool_calls"
+    )]
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
@@ -332,9 +337,11 @@ fn fail(tx: &Sender<StreamUpdate>, message: String) -> Result<(), String> {
 
 /// Extracts incremental `tool_calls` from one SSE delta frame.
 pub fn parse_tool_call_delta(frame: &str) -> Result<Vec<ToolCallFragment>, String> {
-    let value: serde_json::Value = serde_json::from_str(frame.trim())
-        .map_err(|err| format!("invalid SSE frame: {err}"))?;
-    let Some(fragments) = value.pointer("/choices/0/delta/tool_calls").and_then(|v| v.as_array())
+    let value: serde_json::Value =
+        serde_json::from_str(frame.trim()).map_err(|err| format!("invalid SSE frame: {err}"))?;
+    let Some(fragments) = value
+        .pointer("/choices/0/delta/tool_calls")
+        .and_then(|v| v.as_array())
     else {
         return Ok(Vec::new());
     };
@@ -375,20 +382,20 @@ pub fn parse_tool_call_delta(frame: &str) -> Result<Vec<ToolCallFragment>, Strin
 pub fn aggregate_tool_calls(fragments: &[ToolCallFragment]) -> Vec<ToolCall> {
     let mut calls: Vec<(usize, ToolCall)> = Vec::new();
     for fragment in fragments {
-        let entry = if let Some(entry) = calls.iter_mut().find(|(index, _)| *index == fragment.index)
-        {
-            entry
-        } else {
-            calls.push((
-                fragment.index,
-                ToolCall {
-                    id: String::new(),
-                    name: String::new(),
-                    arguments: String::new(),
-                },
-            ));
-            calls.last_mut().unwrap()
-        };
+        let entry =
+            if let Some(entry) = calls.iter_mut().find(|(index, _)| *index == fragment.index) {
+                entry
+            } else {
+                calls.push((
+                    fragment.index,
+                    ToolCall {
+                        id: String::new(),
+                        name: String::new(),
+                        arguments: String::new(),
+                    },
+                ));
+                calls.last_mut().unwrap()
+            };
         let call = &mut entry.1;
         if call.id.is_empty() {
             if let Some(id) = &fragment.id {
