@@ -30,7 +30,7 @@ impl Default for Settings {
             base_url: DEFAULT_BASE_URL.to_string(),
             api_key: String::new(),
             model: String::new(),
-            include_terminal_context: true,
+            include_terminal_context: false,
         }
     }
 }
@@ -69,13 +69,15 @@ impl Settings {
 
         #[cfg(unix)]
         let file = {
-            use std::os::unix::fs::OpenOptionsExt;
-            OpenOptions::new()
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            let file = OpenOptions::new()
                 .write(true)
                 .create(true)
                 .truncate(true)
                 .mode(0o600)
-                .open(path)?
+                .open(path)?;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            file
         };
         #[cfg(not(unix))]
         let file = OpenOptions::new()
@@ -101,7 +103,7 @@ mod tests {
         let s = Settings::default();
         assert_eq!(s.base_url, "http://localhost:4000/v1");
         assert!(s.model.is_empty());
-        assert!(s.include_terminal_context);
+        assert!(!s.include_terminal_context);
     }
 
     #[test]
@@ -152,6 +154,24 @@ mod tests {
         std::fs::write(&path, "{not json").unwrap();
         assert_eq!(load_from(&path), Settings::default());
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_repairs_permissions_on_existing_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("repterm-perms-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("settings.json");
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        Settings::default().save_to(&path).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
         std::fs::remove_dir_all(&dir).ok();
     }
 

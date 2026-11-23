@@ -23,8 +23,8 @@ A fast, simple terminal emulator built with Rust, egui, and egui_term.
 | Next tab | `Ctrl+PageDown` |
 | Delete word | `Ctrl+Backspace` |
 | Toggle AI chat / terminal | `Ctrl+Shift+Enter` |
-| Open AI chat from the terminal | `!` at the start of a line |
-| Run a proposed command | `!command` in the chat, then `Enter` |
+| Ask AI without leaving the terminal | `!question`, then `Enter` |
+| Run a proposed command from AI chat | `!command`, then `Enter` |
 | Send a chat message | `Enter` |
 | Newline in the chat | `Shift+Enter` |
 | Cancel a streaming answer | "Cancelar" button in the chat |
@@ -39,9 +39,14 @@ key and model; models are discovered from `GET {base_url}/models`, with manual
 entry as a fallback. Settings are stored in `$XDG_CONFIG_HOME/repterm/settings.json`
 (or `~/.config/repterm/settings.json`) with `0600` permissions on Unix.
 
-Each request includes the active tab's path, branch and changed files, plus the
-last 120 terminal lines and the current selection unless "Incluir contexto del
-terminal" is disabled. Answers are streamed and may contain fenced code blocks;
+In the terminal, type `!question` and press Enter to ask the assistant without
+leaving the terminal. The question and answer stay in the terminal scrollback,
+like shell output. After that, keep typing replies without `!` until `Esc`
+returns to the normal shell. Press `Ctrl+Shift+Enter` for the full chat.
+
+Each request includes the active tab's path, branch and changed files. Terminal
+output and the current selection are also included only when "Incluir contexto
+del terminal" is enabled. Answers may contain fenced code blocks; in full chat,
 use "Insertar en terminal" to copy one into the active terminal, or type
 `!command` in the composer to write and run it there. The assistant has no tool
 access and never executes commands by itself.

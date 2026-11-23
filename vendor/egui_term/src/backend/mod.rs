@@ -278,6 +278,23 @@ impl TerminalBackend {
         &self.last_content
     }
 
+    /// Writes bytes into the terminal display without sending them to the shell.
+    pub fn inject_output(&mut self, bytes: &[u8]) {
+        let term = self.term.clone();
+        let mut term = term.lock();
+        let mut parser =
+            alacritty_terminal::vte::ansi::Processor::<alacritty_terminal::vte::ansi::StdSyncHandler>::new();
+        parser.advance(&mut *term, bytes);
+        term.scroll_display(Scroll::Bottom);
+    }
+
+    /// Writes output ending in CRLF and restores the current prompt's cell attributes.
+    pub fn inject_output_preserving_prompt(&mut self, bytes: &[u8]) {
+        let term = self.term.clone();
+        let mut term = term.lock();
+        inject_output_preserving_prompt(&mut term, bytes);
+    }
+
     fn process_link_action(
         &mut self,
         terminal: &Term<EventProxy>,
@@ -520,6 +537,28 @@ impl TerminalBackend {
     }
 }
 
+fn inject_output_preserving_prompt<T: EventListener>(term: &mut Term<T>, bytes: &[u8]) {
+    let grid = term.grid();
+    let cursor = grid.cursor.clone();
+    let width = cursor.point.column.0 + usize::from(cursor.input_needs_wrap);
+    let prompt: Vec<Cell> = (0..width)
+        .map(|column| grid[Point::new(cursor.point.line, Column(column))].clone())
+        .collect();
+
+    let mut parser =
+        alacritty_terminal::vte::ansi::Processor::<alacritty_terminal::vte::ansi::StdSyncHandler>::new();
+    parser.advance(term, bytes);
+    let grid = term.grid_mut();
+    let line = grid.cursor.point.line;
+    for (column, cell) in prompt.into_iter().enumerate() {
+        grid[Point::new(line, Column(column))] = cell;
+    }
+    grid.cursor = cursor;
+    grid.cursor.point.line = line;
+    // TerminalView::show syncs and paints the full grid on each draw.
+    term.scroll_display(Scroll::Bottom);
+}
+
 /// Copied from alacritty/src/display/hint.rs:
 /// Iterate over all visible regex matches.
 fn visible_regex_match_iter<'a>(
@@ -573,5 +612,109 @@ pub struct EventProxy(mpsc::Sender<Event>);
 impl EventListener for EventProxy {
     fn send_event(&self, event: Event) {
         let _ = self.0.send(event.clone());
+    }
+}
+
+#[cfg(test)]
+mod prompt_preservation_tests {
+    use super::inject_output_preserving_prompt;
+    use alacritty_terminal::event::VoidListener;
+    use alacritty_terminal::grid::{Dimensions, Scroll};
+    use alacritty_terminal::index::{Column, Line, Point};
+    use alacritty_terminal::term::cell::{Cell, Flags};
+    use alacritty_terminal::term::{test::TermSize, Config, Term};
+    use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, Rgb, StdSyncHandler};
+
+    fn terminal(columns: usize, lines: usize) -> Term<VoidListener> {
+        Term::new(Config::default(), &TermSize::new(columns, lines), VoidListener)
+    }
+
+    fn write(term: &mut Term<VoidListener>, text: &str) {
+        Processor::<StdSyncHandler>::new().advance(term, text.as_bytes());
+    }
+
+    fn cells(term: &Term<VoidListener>, line: Line, width: usize) -> Vec<Cell> {
+        (0..width)
+            .map(|column| term.grid()[Point::new(line, Column(column))].clone())
+            .collect()
+    }
+
+    #[test]
+    fn restores_colored_and_styled_prompt_cells_with_cursor_template() {
+        let mut term = terminal(30, 5);
+        write(&mut term, "\x1b[1;3;4;38;2;12;34;56;48;5;123mA\u{301}界\x1b[0;32m$ \x1b[35m");
+        let cursor = term.grid().cursor.clone();
+        let original = cells(&term, cursor.point.line, cursor.point.column.0);
+        assert_eq!(original[0].fg, Color::Spec(Rgb { r: 12, g: 34, b: 56 }));
+        assert_eq!(original[0].bg, Color::Indexed(123));
+        assert!(original[0].flags.contains(Flags::BOLD | Flags::ITALIC | Flags::UNDERLINE));
+        assert_eq!(original[0].zerowidth(), Some(&['\u{301}'][..]));
+        assert!(original[1].flags.contains(Flags::WIDE_CHAR));
+        assert!(original[2].flags.contains(Flags::WIDE_CHAR_SPACER));
+        assert_eq!(original[3].fg, Color::Named(NamedColor::Green));
+
+        inject_output_preserving_prompt(&mut term, b"!q\r\nanswer\r\n");
+
+        let restored = &term.grid().cursor;
+        assert_eq!(cells(&term, restored.point.line, original.len()), original);
+        assert_eq!(restored.point.column, cursor.point.column);
+        assert_eq!(restored.template, cursor.template);
+        assert_eq!(restored.charsets, cursor.charsets);
+        assert_eq!(restored.input_needs_wrap, cursor.input_needs_wrap);
+        let point = restored.point;
+        write(&mut term, "x");
+        assert_eq!(term.grid()[point].fg, Color::Named(NamedColor::Magenta));
+    }
+
+    #[test]
+    fn preserves_history_and_prompt_across_follow_up_when_scrolled_back() {
+        let mut term = terminal(20, 3);
+        write(&mut term, "history\r\n\x1b[31m$\x1b[0m ");
+        let original = cells(&term, Line(1), 2);
+        inject_output_preserving_prompt(&mut term, b"!q\r\nanswer\r\n");
+        assert_eq!(term.grid().history_size(), 1);
+        assert_eq!(term.grid()[Point::new(Line(-1), Column(0))].c, 'h');
+        assert_eq!(term.grid()[Point::new(Line(0), Column(2))].c, '!');
+        assert_eq!(term.grid()[Point::new(Line(1), Column(0))].c, 'a');
+        assert_eq!(cells(&term, Line(2), 2), original);
+
+        term.scroll_display(Scroll::Delta(1));
+        assert_eq!(term.grid().display_offset(), 1);
+        inject_output_preserving_prompt(&mut term, b"next\r\nreply\r\n");
+        assert_eq!(term.grid().display_offset(), 0);
+        assert_eq!(cells(&term, Line(2), 2), original);
+        assert_eq!(term.grid()[Point::new(Line(-3), Column(0))].c, 'h');
+        assert_eq!(term.grid()[Point::new(Line(-2), Column(2))].c, '!');
+        assert_eq!(term.grid()[Point::new(Line(0), Column(2))].c, 'n');
+        assert_eq!(term.grid()[Point::new(Line(1), Column(0))].c, 'r');
+    }
+
+    #[test]
+    fn preserves_pending_wrap_and_last_column_for_next_shell_output() {
+        let mut term = terminal(5, 4);
+        write(&mut term, "\x1b[34mABCDE");
+        let cursor = term.grid().cursor.clone();
+        assert!(cursor.input_needs_wrap);
+        let original = cells(&term, Line(0), 5);
+
+        inject_output_preserving_prompt(&mut term, b"!q\r\nok\r\n");
+
+        assert_eq!(cells(&term, Line(3), 5), original);
+        assert_eq!(term.grid().cursor.point.column, Column(4));
+        assert!(term.grid().cursor.input_needs_wrap);
+        write(&mut term, "Z");
+        assert_eq!(term.grid()[Point::new(Line(2), Column(4))].c, 'E');
+        assert!(term.grid()[Point::new(Line(2), Column(4))].flags.contains(Flags::WRAPLINE));
+        assert_eq!(term.grid()[Point::new(Line(3), Column(0))].c, 'Z');
+        assert_eq!(term.grid().cursor.point.column, Column(1));
+    }
+
+    #[test]
+    fn preserves_zero_column_cursor() {
+        let mut term = terminal(20, 3);
+        inject_output_preserving_prompt(&mut term, b"!q\r\nanswer\r\n");
+        assert_eq!(term.grid().cursor.point, Point::new(Line(2), Column(0)));
+        write(&mut term, "x");
+        assert_eq!(term.grid()[Point::new(Line(2), Column(0))].c, 'x');
     }
 }

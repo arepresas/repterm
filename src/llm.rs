@@ -137,10 +137,29 @@ impl LlmClient {
             "messages": messages,
         });
 
-        let response = ureq::post(&url)
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .timeout_recv_response(Some(std::time::Duration::from_secs(30)))
+            .timeout_per_read(Some(std::time::Duration::from_secs(30)))
+            .build()
+            .into();
+        let mut response = agent
+            .post(&url)
             .header("Authorization", &self.auth_header())
             .send_json(payload)
             .map_err(|err| format!("POST {url} failed: {err}"))?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.body_mut().read_to_string().unwrap_or_default();
+            let body = body.trim();
+            let detail = if body.is_empty() {
+                format!("POST {url} failed: {status}")
+            } else {
+                let body: String = body.chars().take(500).collect();
+                format!("POST {url} failed: {status}: {body}")
+            };
+            return fail(tx, detail);
+        }
 
         let mut reader = response.into_body().into_reader();
         let mut chunk = [0u8; 4096];
@@ -154,6 +173,12 @@ impl LlmClient {
 
             let read = match reader.read(&mut chunk) {
                 Ok(read) => read,
+                Err(err)
+                    if self.cancel.load(Ordering::Relaxed)
+                        || err.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    continue;
+                }
                 Err(err) => return fail(tx, format!("read error: {err}")),
             };
             if read == 0 {

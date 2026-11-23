@@ -8,7 +8,7 @@ use egui::Modifiers;
 use egui::MouseWheelUnit;
 use egui::Shape;
 use egui::Widget;
-use egui::{Align2, Painter, Pos2, Rect, Response, Stroke, Vec2};
+use egui::{Align2, Color32, FontId, Painter, Pos2, Rect, Response, Stroke, Vec2};
 use egui::{Id, PointerButton};
 
 use crate::backend::BackendCommand;
@@ -29,11 +29,29 @@ enum InputAction {
     Ignore,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct TerminalViewState {
     is_dragged: bool,
     scroll_pixels: f32,
     current_mouse_position_on_grid: TerminalGridPoint,
+    line_input: Option<String>,
+    bang_draft: Option<String>,
+    bang_cursor: usize,
+    bang_committed: Option<String>,
+}
+
+impl Default for TerminalViewState {
+    fn default() -> Self {
+        Self {
+            is_dragged: false,
+            scroll_pixels: 0.0,
+            current_mouse_position_on_grid: TerminalGridPoint::default(),
+            line_input: Some(String::new()),
+            bang_draft: None,
+            bang_cursor: 0,
+            bang_committed: None,
+        }
+    }
 }
 
 pub struct TerminalView<'a> {
@@ -44,6 +62,12 @@ pub struct TerminalView<'a> {
     font: TerminalFont,
     theme: TerminalTheme,
     bindings_layout: BindingsLayout,
+    bang_submit: Option<&'a mut Option<String>>,
+    bang_draft: Option<&'a mut Option<String>>,
+    inline_lines: Option<&'a [String]>,
+    agent_conversation: bool,
+    release_overlay: bool,
+    clear_draft: bool,
 }
 
 impl Widget for TerminalView<'_> {
@@ -83,7 +107,49 @@ impl<'a> TerminalView<'a> {
             font: TerminalFont::default(),
             theme: TerminalTheme::default(),
             bindings_layout: BindingsLayout::new(),
+            bang_submit: None,
+            bang_draft: None,
+            inline_lines: None,
+            agent_conversation: false,
+            release_overlay: false,
+            clear_draft: false,
         }
+    }
+
+    #[inline]
+    pub fn set_bang_submit(mut self, target: &'a mut Option<String>) -> Self {
+        self.bang_submit = Some(target);
+        self
+    }
+
+    #[inline]
+    pub fn set_bang_draft(mut self, target: &'a mut Option<String>) -> Self {
+        self.bang_draft = Some(target);
+        self
+    }
+
+    #[inline]
+    pub fn set_inline_lines(mut self, lines: &'a [String]) -> Self {
+        self.inline_lines = Some(lines);
+        self
+    }
+
+    #[inline]
+    pub fn set_agent_conversation(mut self, enabled: bool) -> Self {
+        self.agent_conversation = enabled;
+        self
+    }
+
+    #[inline]
+    pub fn set_release_overlay(mut self, release: bool) -> Self {
+        self.release_overlay = release;
+        self
+    }
+
+    #[inline]
+    pub fn set_clear_draft(mut self, clear: bool) -> Self {
+        self.clear_draft = clear;
+        self
     }
 
     #[inline]
@@ -139,7 +205,7 @@ impl<'a> TerminalView<'a> {
     }
 
     fn process_input(
-        self,
+        mut self,
         layout: &Response,
         state: &mut TerminalViewState,
     ) -> Self {
@@ -149,9 +215,28 @@ impl<'a> TerminalView<'a> {
             return self;
         }
 
+        if self.release_overlay || self.clear_draft {
+            state.bang_committed = None;
+        }
+        if self.clear_draft {
+            state.bang_draft = None;
+            state.bang_cursor = 0;
+        }
+
         let modifiers = layout.ctx.input(|i| i.modifiers);
         let events = layout.ctx.input(|i| i.events.clone());
         for event in events {
+            match track_bang_submit(&event, state, self.agent_conversation) {
+                BangAction::Consume => continue,
+                BangAction::Submit(question) => {
+                    if let Some(target) = self.bang_submit.as_deref_mut() {
+                        *target = Some(question);
+                    }
+                    continue;
+                }
+                BangAction::PassThrough => {}
+            }
+
             let mut input_actions = vec![];
 
             match event {
@@ -214,6 +299,10 @@ impl<'a> TerminalView<'a> {
             }
         }
 
+        if let Some(target) = self.bang_draft.as_deref_mut() {
+            *target = state.bang_draft.clone();
+        }
+
         self
     }
 
@@ -230,6 +319,30 @@ impl<'a> TerminalView<'a> {
         let cell_width = content.terminal_size.cell_width as f32;
         let global_bg =
             self.theme.get_color(Color::Named(NamedColor::Background));
+        let cursor = content.grid.cursor.point;
+        let cursor_line = cursor.line.0 + content.grid.display_offset() as i32;
+        let indicator_active = agent_indicator_active(
+            self.agent_conversation,
+            state.bang_draft.is_some(),
+            state.bang_committed.is_some(),
+        );
+        let cursor_visible = cursor_row_visible(cursor_line, cell_height, layout.rect.height());
+        let indicator_column = if indicator_active && cursor_visible {
+            indicator_column(content.grid.display_iter().filter_map(|indexed| {
+                (indexed.point.line == cursor.line
+                    && indexed.point.column.0 < cursor.column.0)
+                    .then_some((
+                        indexed.point.column.0,
+                        indexed.c,
+                        !indexed.cell.flags.intersects(
+                            cell::Flags::WIDE_CHAR | cell::Flags::WIDE_CHAR_SPACER,
+                        ),
+                    ))
+            }))
+        } else {
+            None
+        };
+        let mut indicator_color = None;
 
         let mut shapes = vec![Shape::Rect(RectShape::filled(
             Rect::from_min_max(layout_min, layout_max),
@@ -280,6 +393,11 @@ impl<'a> TerminalView<'a> {
             if is_inverse || is_selected {
                 std::mem::swap(&mut fg, &mut bg);
             }
+            let is_indicator = indexed.point.line == cursor.line
+                && indicator_column == Some(indexed.point.column.0);
+            if is_indicator {
+                indicator_color = Some((fg, bg));
+            }
 
             if global_bg != bg {
                 shapes.push(Shape::Rect(RectShape::filled(
@@ -306,7 +424,7 @@ impl<'a> TerminalView<'a> {
             }
 
             // Handle cursor rendering
-            if content.grid.cursor.point == indexed.point {
+            if content.grid.cursor.point == indexed.point && state.bang_draft.is_none() {
                 let cursor_color = self.theme.get_color(content.cursor.fg);
                 shapes.push(Shape::Rect(RectShape::filled(
                     Rect::from_min_size(
@@ -319,7 +437,7 @@ impl<'a> TerminalView<'a> {
             }
 
             // Draw text content
-            if indexed.c != ' ' && indexed.c != '\t' {
+            if !is_indicator && indexed.c != ' ' && indexed.c != '\t' {
                 if content.grid.cursor.point == indexed.point
                     && is_app_cursor_mode
                 {
@@ -340,8 +458,449 @@ impl<'a> TerminalView<'a> {
             }
         }
 
-        painter.extend(shapes);
+        let cursor_x = layout_min.x + cell_width * cursor.column.0 as f32;
+        let cursor_y = layout_min.y + cell_height * cursor_line as f32;
+        let text_color = self.theme.get_color(Color::Named(NamedColor::Foreground));
+        if let Some(draft) = state.bang_draft.as_deref() {
+            push_terminal_line(
+                &mut shapes,
+                painter,
+                self.font.font_type(),
+                text_color,
+                cursor_x,
+                cursor_y,
+                cell_width,
+                draft,
+            );
+            let cursor_color = self.theme.get_color(content.cursor.fg);
+            shapes.push(Shape::Rect(RectShape::filled(
+                Rect::from_min_size(
+                    Pos2::new(
+                        cursor_x + state.bang_cursor.min(draft.chars().count()) as f32 * cell_width,
+                        cursor_y,
+                    ),
+                    Vec2::new(cell_width, cell_height),
+                ),
+                CornerRadius::default(),
+                cursor_color,
+            )));
+        }
+        if let Some(committed) = state.bang_committed.as_deref() {
+            let response = self.inline_lines.unwrap_or(&[]);
+            let rows = 1 + response.len();
+            shapes.push(Shape::Rect(RectShape::filled(
+                Rect::from_min_size(
+                    Pos2::new(cursor_x, cursor_y),
+                    Vec2::new((layout_max.x - cursor_x).max(0.0), cell_height),
+                ),
+                CornerRadius::ZERO,
+                global_bg,
+            )));
+            if rows > 1 {
+                shapes.push(Shape::Rect(RectShape::filled(
+                    Rect::from_min_size(
+                        Pos2::new(layout_min.x, cursor_y + cell_height),
+                        Vec2::new(layout.rect.width(), (rows - 1) as f32 * cell_height),
+                    ),
+                    CornerRadius::ZERO,
+                    global_bg,
+                )));
+            }
+            push_terminal_line(
+                &mut shapes,
+                painter,
+                self.font.font_type(),
+                text_color,
+                cursor_x,
+                cursor_y,
+                cell_width,
+                committed,
+            );
+            for (row, line) in response.iter().enumerate() {
+                push_terminal_line(
+                    &mut shapes,
+                    painter,
+                    self.font.font_type(),
+                    text_color,
+                    layout_min.x,
+                    cursor_y + (row as f32 + 1.0) * cell_height,
+                    cell_width,
+                    line,
+                );
+            }
+        }
+
+        painter.with_clip_rect(layout.rect).extend(shapes);
+        if let (Some(column), Some((color, background))) = (indicator_column, indicator_color) {
+            let rect = Rect::from_min_size(
+                Pos2::new(layout_min.x + column as f32 * cell_width, cursor_y),
+                Vec2::new(cell_width, cell_height),
+            );
+            paint_robot(&painter.with_clip_rect(rect.intersect(layout.rect)), rect, color, background);
+        }
     }
+}
+
+fn agent_indicator_active(conversation: bool, draft: bool, committed: bool) -> bool {
+    conversation || draft || committed
+}
+
+fn cursor_row_visible(line: i32, cell_height: f32, viewport_height: f32) -> bool {
+    line >= 0 && (line as f32 + 1.0) * cell_height <= viewport_height
+}
+
+// Replace only the leftmost prompt symbol, never a later cell or prompt text.
+fn indicator_column(cells: impl Iterator<Item = (usize, char, bool)>) -> Option<usize> {
+    let (column, ch, safe) = cells
+        .filter(|(_, ch, _)| !ch.is_whitespace())
+        .min_by_key(|(column, _, _)| *column)?;
+    (safe && matches!(ch, '❯' | '➜' | '>' | '→' | '▶' | '➤')).then_some(column)
+}
+
+fn paint_robot(painter: &Painter, cell: Rect, color: Color32, eye_color: Color32) {
+    let point = |x: f32, y: f32| Pos2::new(
+        cell.min.x + cell.width() * x,
+        cell.min.y + cell.height() * y,
+    );
+    let stroke = Stroke::new((cell.width() * 0.13).max(1.0), color);
+    painter.line_segment([point(0.5, 0.13), point(0.5, 0.3)], stroke);
+    painter.circle_filled(point(0.5, 0.13), (cell.width() * 0.1).max(0.7), color);
+    painter.rect_filled(Rect::from_min_max(point(0.06, 0.3), point(0.94, 0.83)), 1, color);
+    painter.circle_filled(point(0.32, 0.5), (cell.width() * 0.1).max(0.7), eye_color);
+    painter.circle_filled(point(0.68, 0.5), (cell.width() * 0.1).max(0.7), eye_color);
+    painter.line_segment([point(0.3, 0.69), point(0.7, 0.69)], Stroke::new(1.0_f32, eye_color));
+}
+
+fn push_terminal_line(
+    shapes: &mut Vec<Shape>,
+    painter: &Painter,
+    font: FontId,
+    color: Color32,
+    x: f32,
+    y: f32,
+    cell_width: f32,
+    text: &str,
+) {
+    for (index, ch) in text.chars().enumerate() {
+        if ch == ' ' || ch == '\t' {
+            continue;
+        }
+        shapes.push(Shape::text(
+            &painter.fonts(|fonts| fonts.clone()),
+            Pos2::new(x + index as f32 * cell_width + cell_width / 2.0, y),
+            Align2::CENTER_TOP,
+            ch,
+            font.clone(),
+            color,
+        ));
+    }
+}
+
+fn edit_bang_draft(event: &egui::Event, state: &mut TerminalViewState) {
+    let Some(draft) = state.bang_draft.as_deref() else {
+        return;
+    };
+    let cursor = state.bang_cursor.min(draft.chars().count());
+    let edited = match event {
+        egui::Event::Text(text) | egui::Event::Paste(text)
+            if !text.chars().all(|ch| ch == '\n' || ch == '\r') =>
+        {
+            Some(insert_at(draft, cursor, text))
+        }
+        egui::Event::Key {
+            key: Key::Backspace,
+            pressed: true,
+            modifiers,
+            ..
+        } if modifiers.command || modifiers.ctrl => Some(kill_word_before(draft, cursor)),
+        egui::Event::Key {
+            key: Key::Backspace,
+            pressed: true,
+            ..
+        } => Some(delete_before(draft, cursor)),
+        egui::Event::Key {
+            key: Key::Delete,
+            pressed: true,
+            ..
+        } => Some(delete_after(draft, cursor)),
+        egui::Event::Key {
+            key: Key::ArrowLeft,
+            pressed: true,
+            modifiers,
+            ..
+        } if modifiers.command || modifiers.ctrl => Some((draft.to_owned(), word_left(draft, cursor))),
+        egui::Event::Key {
+            key: Key::ArrowRight,
+            pressed: true,
+            modifiers,
+            ..
+        } if modifiers.command || modifiers.ctrl => Some((draft.to_owned(), word_right(draft, cursor))),
+        egui::Event::Key {
+            key: Key::ArrowLeft,
+            pressed: true,
+            ..
+        } => Some((draft.to_owned(), cursor.saturating_sub(1))),
+        egui::Event::Key {
+            key: Key::ArrowRight,
+            pressed: true,
+            ..
+        } => Some((draft.to_owned(), (cursor + 1).min(draft.chars().count()))),
+        egui::Event::Key {
+            key: Key::Home,
+            pressed: true,
+            ..
+        } => Some((draft.to_owned(), 0)),
+        egui::Event::Key {
+            key: Key::End,
+            pressed: true,
+            ..
+        } => Some((draft.to_owned(), draft.chars().count())),
+        egui::Event::Key {
+            key: Key::Escape,
+            pressed: true,
+            ..
+        } => Some((String::new(), 0)),
+        _ => None,
+    };
+    if let Some((text, cursor)) = edited {
+        state.bang_cursor = cursor;
+        state.bang_draft = Some(text);
+    }
+}
+
+fn insert_at(text: &str, cursor: usize, insert: &str) -> (String, usize) {
+    let at = char_byte(text, cursor);
+    let mut out = String::new();
+    out.push_str(&text[..at]);
+    out.push_str(insert);
+    out.push_str(&text[at..]);
+    (out, cursor + insert.chars().count())
+}
+
+fn delete_before(text: &str, cursor: usize) -> (String, usize) {
+    if cursor == 0 {
+        return (text.to_owned(), 0);
+    }
+    let end = char_byte(text, cursor);
+    let start = char_byte(text, cursor - 1);
+    let mut out = String::new();
+    out.push_str(&text[..start]);
+    out.push_str(&text[end..]);
+    (out, cursor - 1)
+}
+
+fn delete_after(text: &str, cursor: usize) -> (String, usize) {
+    let start = char_byte(text, cursor);
+    let Some(next) = text[start..].chars().next() else {
+        return (text.to_owned(), cursor);
+    };
+    let mut out = String::new();
+    out.push_str(&text[..start]);
+    out.push_str(&text[start + next.len_utf8()..]);
+    (out, cursor)
+}
+
+fn kill_word_before(text: &str, cursor: usize) -> (String, usize) {
+    let start = word_start_left(text, cursor);
+    let from = char_byte(text, start);
+    let to = char_byte(text, cursor);
+    let mut out = String::new();
+    out.push_str(&text[..from]);
+    out.push_str(&text[to..]);
+    (out, start)
+}
+
+fn word_start_left(text: &str, cursor: usize) -> usize {
+    let chars: Vec<char> = text.chars().collect();
+    let mut index = cursor.min(chars.len());
+    while index > 0 && chars[index - 1].is_whitespace() {
+        index -= 1;
+    }
+    while index > 0 && !chars[index - 1].is_whitespace() {
+        index -= 1;
+    }
+    index
+}
+
+fn word_left(text: &str, cursor: usize) -> usize {
+    let chars: Vec<char> = text.chars().collect();
+    let mut index = cursor.min(chars.len());
+    if index == 0 {
+        return 0;
+    }
+    if !chars[index - 1].is_whitespace() {
+        while index > 0 && !chars[index - 1].is_whitespace() {
+            index -= 1;
+        }
+    }
+    while index > 0 && chars[index - 1].is_whitespace() {
+        index -= 1;
+    }
+    index
+}
+
+fn word_right(text: &str, cursor: usize) -> usize {
+    let chars: Vec<char> = text.chars().collect();
+    let mut index = cursor.min(chars.len());
+    if index < chars.len() && !chars[index].is_whitespace() {
+        while index < chars.len() && !chars[index].is_whitespace() {
+            index += 1;
+        }
+        return index;
+    }
+    while index < chars.len() && chars[index].is_whitespace() {
+        index += 1;
+    }
+    while index < chars.len() && !chars[index].is_whitespace() {
+        index += 1;
+    }
+    index
+}
+
+fn is_bang_submit(event: &egui::Event) -> bool {
+    match event {
+        egui::Event::Key {
+            key: Key::Enter,
+            pressed: true,
+            modifiers,
+            ..
+        } => !modifiers.alt,
+        egui::Event::Text(text) | egui::Event::Paste(text) => {
+            !text.is_empty() && text.chars().all(|ch| ch == '\n' || ch == '\r')
+        }
+        _ => false,
+    }
+}
+
+fn submit_bang(state: &mut TerminalViewState) -> BangAction {
+    let typed = state
+        .bang_draft
+        .take()
+        .unwrap_or_default()
+        .replace(['\n', '\r'], "");
+    let typed = typed.trim().to_owned();
+    state.bang_cursor = 0;
+    state.bang_committed = Some(typed.clone());
+    state.line_input = Some(String::new());
+    if typed.is_empty() || typed == "!" {
+        BangAction::Consume
+    } else {
+        BangAction::Submit(typed)
+    }
+}
+
+fn char_byte(text: &str, cursor: usize) -> usize {
+    text.char_indices()
+        .nth(cursor)
+        .map(|(index, _)| index)
+        .unwrap_or(text.len())
+}
+
+enum BangAction {
+    PassThrough,
+    Consume,
+    Submit(String),
+}
+
+fn track_bang_submit(
+    event: &egui::Event,
+    state: &mut TerminalViewState,
+    agent_conversation: bool,
+) -> BangAction {
+    if state.bang_draft.is_none()
+        && state.bang_committed.is_some()
+        && matches!(
+            event,
+            egui::Event::Text(_)
+                | egui::Event::Paste(_)
+                | egui::Event::Key {
+                    key: Key::Escape | Key::Enter,
+                    pressed: true,
+                    ..
+                }
+        )
+    {
+        state.bang_committed = None;
+        if matches!(event, egui::Event::Key { key: Key::Escape, .. }) {
+            return BangAction::Consume;
+        }
+    }
+
+    if state.bang_draft.is_some() {
+        if is_bang_submit(event) {
+            return submit_bang(state);
+        }
+        edit_bang_draft(event, state);
+        if state.bang_draft.as_deref().is_some_and(str::is_empty) {
+            state.bang_draft = None;
+            state.bang_cursor = 0;
+        }
+        return BangAction::Consume;
+    }
+
+    match event {
+        egui::Event::Text(text) | egui::Event::Paste(text) => {
+            let line_empty = state.line_input.as_deref().is_none_or(str::is_empty);
+            if line_empty
+                && !text.contains(['\n', '\r'])
+                && (text.starts_with('!') || agent_conversation)
+            {
+                state.bang_cursor = text.chars().count();
+                state.bang_draft = Some(text.clone());
+                state.line_input = Some(String::new());
+                return BangAction::Consume;
+            }
+            if let Some(input) = &mut state.line_input {
+                input.push_str(text);
+            }
+        }
+        egui::Event::Key {
+            key: Key::Backspace,
+            pressed: true,
+            modifiers,
+            ..
+        } if modifiers.is_none() => {
+            if let Some(input) = &mut state.line_input {
+                input.pop();
+            }
+        }
+        egui::Event::Key {
+            key: Key::U,
+            pressed: true,
+            modifiers,
+            ..
+        } if modifiers.command_only() => state.line_input = Some(String::new()),
+        egui::Event::Key {
+            key: Key::Enter,
+            pressed: true,
+            modifiers,
+            ..
+        } if modifiers.is_none() => state.line_input = Some(String::new()),
+        egui::Event::Key {
+            key:
+                Key::ArrowUp
+                | Key::ArrowDown
+                | Key::ArrowLeft
+                | Key::ArrowRight
+                | Key::Home
+                | Key::End
+                | Key::PageUp
+                | Key::PageDown
+                | Key::Tab
+                | Key::Delete
+                | Key::Escape,
+            pressed: true,
+            ..
+        } => state.line_input = None,
+        egui::Event::Key {
+            pressed: true,
+            modifiers,
+            ..
+        } if !modifiers.is_none() && !modifiers.shift_only() => state.line_input = None,
+        _ => {}
+    }
+
+    BangAction::PassThrough
 }
 
 fn process_keyboard_event(
@@ -643,4 +1202,75 @@ fn process_mouse_move(
     }
 
     actions
+}
+
+#[cfg(test)]
+mod bang_edit_tests {
+    use super::{delete_before, insert_at, kill_word_before, word_left, word_right};
+
+    #[test]
+    fn insert_and_backspace_keep_middle_cursor() {
+        let (text, cursor) = insert_at("!hola", 1, "X");
+        assert_eq!(text, "!Xhola");
+        assert_eq!(cursor, 2);
+        let (text, cursor) = delete_before(&text, cursor);
+        assert_eq!(text, "!hola");
+        assert_eq!(cursor, 1);
+    }
+
+    #[test]
+    fn ctrl_arrows_jump_words_like_zsh() {
+        let text = "!dime que hora es";
+        assert_eq!(word_right(text, 0), 5);
+        assert_eq!(word_right(text, 5), 9);
+        assert_eq!(word_left(text, text.chars().count()), 14);
+        assert_eq!(word_left(text, 14), 9);
+    }
+
+    #[test]
+    fn ctrl_backspace_deletes_previous_word() {
+        let (text, cursor) = kill_word_before("!dime que hora", 14);
+        assert_eq!(text, "!dime que ");
+        assert_eq!(cursor, 10);
+    }
+}
+
+#[cfg(test)]
+mod agent_indicator_tests {
+    use super::{agent_indicator_active, cursor_row_visible, indicator_column};
+
+    #[test]
+    fn indicator_tracks_draft_stream_and_conversation_but_not_shell() {
+        assert!(!agent_indicator_active(false, false, false));
+        assert!(agent_indicator_active(false, true, false));
+        assert!(agent_indicator_active(false, false, true));
+        assert!(agent_indicator_active(true, false, false));
+    }
+
+    #[test]
+    fn leftmost_prompt_arrow_is_selected_not_later_text() {
+        let prompt = [(0, '➜', true), (1, ' ', true), (2, 'r', true), (3, '❯', true)];
+        assert_eq!(indicator_column(prompt.into_iter()), Some(0));
+    }
+
+    #[test]
+    fn prompt_without_arrow_is_not_overlaid() {
+        let prompt = [(0, '$', true), (1, ' ', true)];
+        assert_eq!(indicator_column(prompt.into_iter()), None);
+        assert_eq!(indicator_column([(0, '$', true)].into_iter()), None);
+    }
+
+    #[test]
+    fn ignores_unsafe_wide_cells_and_arrows_embedded_in_prompt_text() {
+        assert_eq!(indicator_column([(0, '➜', false), (1, ' ', true)].into_iter()), None);
+        assert_eq!(indicator_column([(0, 'x', true), (1, '>', true)].into_iter()), None);
+        assert_eq!(indicator_column([(0, ' ', true), (1, '➜', true)].into_iter()), Some(1));
+    }
+
+    #[test]
+    fn hides_indicator_when_scrollback_moves_cursor_out_of_view() {
+        assert!(cursor_row_visible(3, 10.0, 40.0));
+        assert!(!cursor_row_visible(4, 10.0, 40.0));
+        assert!(!cursor_row_visible(-1, 10.0, 40.0));
+    }
 }
