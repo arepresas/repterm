@@ -2,36 +2,31 @@ name: release
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches:
+      - main
 
 permissions:
   contents: write
+  pull-requests: write
+  issues: write
 
 jobs:
-  changelog:
-    name: changelog
+  release-please:
+    name: release-please
     runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+      version: ${{ steps.release.outputs.version }}
+      sha: ${{ steps.release.outputs.sha }}
     steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.99.1
-      - name: Install git-cliff
-        run: cargo install git-cliff --locked
-      - name: Generate CHANGELOG.md
-        run: git cliff --config cliff.toml --output CHANGELOG.md
-      - uses: actions/upload-artifact@v7
-        with:
-          name: changelog
-          path: CHANGELOG.md
-          if-no-files-found: error
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        id: release
 
-  build:
-    name: build (${{ matrix.target }})
-    needs: changelog
+  package:
+    name: package (${{ matrix.target }})
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -48,6 +43,8 @@ jobs:
             ext: zip
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.release-please.outputs.sha }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.99.1
@@ -60,9 +57,11 @@ jobs:
       - name: Package (unix)
         if: matrix.os != 'windows-latest'
         shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.release-please.outputs.version }}
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
+          version="$RELEASE_VERSION"
           asset="repterm-${version}-${{ matrix.target }}.tar.gz"
           stage="dist/${asset%.tar.gz}"
           mkdir -p "$stage"
@@ -73,8 +72,10 @@ jobs:
       - name: Package (windows)
         if: matrix.os == 'windows-latest'
         shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ needs.release-please.outputs.version }}
         run: |
-          $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          $version = $env:RELEASE_VERSION
           $asset = "repterm-$version-${{ matrix.target }}.zip"
           $stage = "dist/repterm-$version-${{ matrix.target }}"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
@@ -89,15 +90,12 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  release:
-    name: release
-    needs: build
+  upload:
+    name: upload
+    needs: [release-please, package]
+    if: needs.release-please.outputs.release_created == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v8
-        with:
-          name: changelog
-          path: .
       - uses: actions/download-artifact@v8
         with:
           path: dist
@@ -108,22 +106,8 @@ jobs:
           set -euo pipefail
           cd dist
           cat *.sha256 > SHA256SUMS
-          rm *.sha256
-      - name: Determine prerelease
-        id: meta
-        shell: bash
-        run: |
-          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
-            echo "prerelease=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "prerelease=false" >> "$GITHUB_OUTPUT"
-          fi
-      - name: Create GitHub release
-        uses: softprops/action-gh-release@v3
-        with:
-          name: ${{ github.ref_name }}
-          tag_name: ${{ github.ref_name }}
-          generate_release_notes: false
-          prerelease: ${{ steps.meta.outputs.prerelease }}
-          body_path: CHANGELOG.md
-          files: dist/*
+          rm -f *.sha256
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ needs.release-please.outputs.tag_name }}" dist/* --clobber
