@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented here.
 
+## [0.1.1](https://github.com/arepresas/repterm/compare/v0.1.0...v0.1.1) (2026-11-24)
+
+
+### Bug Fixes
+
+* **deps:** unify windows crate to 0.62.2 for Windows builds ([c869e9a](https://github.com/arepresas/repterm/commit/c869e9ac13291deb1d947a7939e630463bf4b156))
+
 ## 0.1.0 (2026-11-24)
 
 
