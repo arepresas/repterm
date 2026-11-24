@@ -37,7 +37,7 @@ The toolchain is pinned in `rust-toolchain.toml` (1.99.1 with rustfmt and clippy
 
 ## Pull requests
 
-Use the repository PR template. `main` requires all five checks (`ci / fmt`, `ci / clippy`, `ci / test`, `ci / build`, `commitlint / lint`) and one approval. Direct pushes to `main` are blocked.
+Use the repository PR template. `main` requires all five checks (`ci / fmt`, `ci / clippy`, `ci / test`, `ci / build`, `commitlint / lint`). No approval is required. Direct pushes to `main` are blocked.
 
 Dependabot opens weekly grouped updates for Cargo and GitHub Actions. It does not auto-merge.
 
