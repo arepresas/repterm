@@ -147,7 +147,7 @@ pub fn resolve_path(raw: &str, cwd: &Path, home: Option<&str>) -> Result<PathBuf
                 missing.push(name.to_os_string());
                 ancestor = ancestor.parent().unwrap_or(Path::new("/"));
             }
-            None => return Err("No se pudo resolver la ruta".into()),
+            None => return Err("Could not resolve path".into()),
         }
     }
 }
@@ -172,8 +172,8 @@ fn string_field(args: &Value, name: &str) -> Result<String, String> {
 }
 
 fn read_text(path: &Path) -> Result<String, String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("No se pudo leer: {e}"))?;
-    String::from_utf8(bytes).map_err(|e| format!("El archivo no es UTF-8 válido: {e}"))
+    let bytes = std::fs::read(path).map_err(|e| format!("Could not read: {e}"))?;
+    String::from_utf8(bytes).map_err(|e| format!("File is not valid UTF-8: {e}"))
 }
 
 fn read_file(path: &Path) -> Result<String, String> {
@@ -196,22 +196,21 @@ fn read_file(path: &Path) -> Result<String, String> {
 fn write_file(path: &Path, content: &str) -> Result<(), String> {
     if content.len() > MAX_WRITE_BYTES {
         return Err(format!(
-            "El contenido supera el límite de {} bytes",
+            "Content exceeds the limit of {} bytes",
             MAX_WRITE_BYTES
         ));
     }
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("No se pudo crear el directorio: {e}"))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("Could not create directory: {e}"))?;
     }
-    std::fs::write(path, content).map_err(|e| format!("No se pudo escribir: {e}"))
+    std::fs::write(path, content).map_err(|e| format!("Could not write: {e}"))
 }
 
 fn edit_file(path: &Path, old: &str, new: &str) -> Result<(), String> {
-    let metadata = std::fs::metadata(path).map_err(|e| format!("No se pudo leer: {e}"))?;
+    let metadata = std::fs::metadata(path).map_err(|e| format!("Could not read: {e}"))?;
     if metadata.len() as usize > MAX_WRITE_BYTES {
         return Err(format!(
-            "El archivo supera el límite de {} bytes",
+            "File exceeds the limit of {} bytes",
             MAX_WRITE_BYTES
         ));
     }
@@ -219,24 +218,24 @@ fn edit_file(path: &Path, old: &str, new: &str) -> Result<(), String> {
     let updated = text.replacen(old, new, 1);
     if updated.len() > MAX_WRITE_BYTES {
         return Err(format!(
-            "El resultado supera el límite de {} bytes",
+            "Result exceeds the limit of {} bytes",
             MAX_WRITE_BYTES
         ));
     }
     if text.matches(old).count() != 1 {
         return Err("El texto a reemplazar debe aparecer exactamente una vez".into());
     }
-    std::fs::write(path, updated).map_err(|e| format!("No se pudo escribir: {e}"))
+    std::fs::write(path, updated).map_err(|e| format!("Could not write: {e}"))
 }
 
 fn list_dir(path: &Path) -> Result<String, String> {
     let mut entries = Vec::new();
-    for entry in std::fs::read_dir(path).map_err(|e| format!("No se pudo listar: {e}"))? {
-        let entry = entry.map_err(|e| format!("No se pudo listar: {e}"))?;
+    for entry in std::fs::read_dir(path).map_err(|e| format!("Could not list: {e}"))? {
+        let entry = entry.map_err(|e| format!("Could not list: {e}"))?;
         let name = entry.file_name().to_string_lossy().into_owned();
         let metadata = entry
             .metadata()
-            .map_err(|e| format!("No se pudo listar: {e}"))?;
+            .map_err(|e| format!("Could not list: {e}"))?;
         if metadata.is_dir() {
             entries.push(format!("{name}/"));
         } else {
@@ -249,7 +248,7 @@ fn list_dir(path: &Path) -> Result<String, String> {
     let mut content = entries.join("\n");
     if total > MAX_LIST_ENTRIES {
         content.push_str(&format!(
-            "\n[recortado a {MAX_LIST_ENTRIES} de {total} entradas]"
+            "\n[truncated to {MAX_LIST_ENTRIES} of {total} entries]"
         ));
     }
     Ok(content)
@@ -257,10 +256,9 @@ fn list_dir(path: &Path) -> Result<String, String> {
 
 pub fn execute(call: &ToolCall, cwd: &Path, home: Option<&str>) -> Result<ToolOutcome, String> {
     let args: Value = serde_json::from_str(&call.arguments)
-        .map_err(|e| format!("Argumentos JSON inválidos: {e}"))?;
+        .map_err(|e| format!("Invalid JSON arguments: {e}"))?;
     string_field(&args, "reason")?;
-    ToolName::from_str(&call.name)
-        .ok_or_else(|| format!("Herramienta desconocida: {}", call.name))?;
+    ToolName::from_str(&call.name).ok_or_else(|| format!("Unknown tool: {}", call.name))?;
     let raw = string_field(&args, "path")?;
     let path = resolve_path(&raw, cwd, home)?;
     let (content, changed_path) = match call.name.as_str() {
@@ -270,7 +268,7 @@ pub fn execute(call: &ToolCall, cwd: &Path, home: Option<&str>) -> Result<ToolOu
             let content = string_field(&args, "content")?;
             write_file(&path, &content)?;
             (
-                format!("Archivo escrito: {raw}"),
+                format!("File written: {raw}"),
                 Some(relative_path(&path, cwd)),
             )
         }
@@ -279,11 +277,11 @@ pub fn execute(call: &ToolCall, cwd: &Path, home: Option<&str>) -> Result<ToolOu
             let new = string_field(&args, "new")?;
             edit_file(&path, &old, &new)?;
             (
-                format!("Archivo modificado: {raw}"),
+                format!("File modified: {raw}"),
                 Some(relative_path(&path, cwd)),
             )
         }
-        _ => return Err(format!("Herramienta desconocida: {}", call.name)),
+        _ => return Err(format!("Unknown tool: {}", call.name)),
     };
     Ok(ToolOutcome {
         call_id: call.id.clone(),

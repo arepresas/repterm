@@ -30,13 +30,14 @@ A fast, simple terminal emulator built with Rust, egui, and egui_term.
 | Run a proposed command from AI chat | `!command`, then `Enter` |
 | Send a chat message | `Enter` |
 | Newline in the chat | `Shift+Enter` |
-| Cancel a streaming answer | "Cancelar" button in the chat |
+| Cancel a streaming answer | "Cancel" button in the chat |
+| Copy selected text | Drag to select, then release the mouse |
 
 Click the branch chip to switch branches (writes `git checkout <branch>` into the active terminal), or the changes chip to open the diff panel. In the branch picker, type to filter, use `↑`/`↓` to navigate, `Enter` to select and `Esc` to cancel.
 
 ## AI agent mode
 
-The chat talks to an OpenAI-compatible LiteLLM proxy. Use the "Ajustes" button in
+The chat talks to an OpenAI-compatible LiteLLM proxy. Use the "Settings" button in
 the chat header to set the base URL (default `http://localhost:4000/v1`), API
 key and model; models are discovered from `GET {base_url}/models`, with manual
 entry as a fallback. Settings are stored in `$XDG_CONFIG_HOME/repterm/settings.json`
@@ -48,11 +49,22 @@ like shell output. After that, keep typing replies without `!` until `Esc`
 returns to the normal shell. Press `Ctrl+Shift+Enter` for the full chat.
 
 Each request includes the active tab's path, branch and changed files. Terminal
-output and the current selection are also included only when "Incluir contexto
-del terminal" is enabled. Answers may contain fenced code blocks; in full chat,
-use "Insertar en terminal" to copy one into the active terminal, or type
-`!command` in the composer to write and run it there. The assistant has no tool
-access and never executes commands by itself.
+output and the current selection are also included only when "Include terminal
+context" is enabled. Answers may contain fenced code blocks; in full chat,
+use "Insert into terminal" to copy one into the active terminal, or type
+`!command` in the composer to write and run it there.
+
+The assistant can list directories and read, write and edit files inside the
+active tab's directory. For any path outside it, a permission dialog asks whether
+to allow it once, always for this session, or reject it. It never executes shell
+commands by itself.
+
+## Copying text
+
+Drag over terminal output or a chat message to select it. Releasing the mouse
+copies the selection to the clipboard and shows a brief "Copied to clipboard"
+notice in the bottom-right corner. `Ctrl+Shift+C` still copies the terminal
+selection without dragging.
 
 ## Git and GitHub
 

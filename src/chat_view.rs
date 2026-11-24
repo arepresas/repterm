@@ -83,7 +83,7 @@ pub fn markdown_layout(text: &str, visuals: &Visuals) -> LayoutJob {
 pub fn tool_result_summary(content: &str) -> String {
     let first = content.lines().next().unwrap_or("").trim();
     let summary = if first.is_empty() {
-        "resultado de herramienta"
+        "tool result"
     } else {
         first
     };
@@ -137,7 +137,7 @@ mod tests {
 
     #[test]
     fn tool_result_summary_is_one_line() {
-        let summary = tool_result_summary("list_dir: 42 entradas\na.txt\nb.txt");
-        assert_eq!(summary, "list_dir: 42 entradas");
+        let summary = tool_result_summary("list_dir: 42 entries\na.txt\nb.txt");
+        assert_eq!(summary, "list_dir: 42 entries");
     }
 }

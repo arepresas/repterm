@@ -320,6 +320,13 @@ impl<'a> TerminalView<'a> {
                         self.backend.process_command(cmd);
                     },
                     InputAction::WriteToClipboard(data) => {
+                        if !data.trim().is_empty() {
+                            // repterm: the app listens for this command to show
+                            // a "Copied to clipboard" confirmation.
+                            layout
+                                .ctx
+                                .send_cmd(egui::OutputCommand::TextSelectionSettled(data.clone()));
+                        }
                         layout.ctx.copy_text(data);
                     },
                     InputAction::Ignore => {},
@@ -1206,7 +1213,14 @@ fn process_left_button_released(
                 state.current_mouse_position_on_grid,
             ))
         } else {
-            InputAction::Ignore
+            // repterm: finish a drag selection by copying what the user
+            // highlighted. The host turns this into a visible confirmation.
+            let content = backend.selectable_content();
+            if content.trim().is_empty() {
+                InputAction::Ignore
+            } else {
+                InputAction::WriteToClipboard(content)
+            }
         }
     }
 }
