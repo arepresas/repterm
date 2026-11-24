@@ -472,8 +472,8 @@ impl<'a> TerminalView<'a> {
                     std::mem::swap(&mut fg, &mut bg);
                 }
 
-                shapes.push(Shape::text(
-                    &painter.fonts(|c| c.clone()),
+                shapes.push(painter.fonts_mut(|fonts| Shape::text(
+                    fonts,
                     Pos2 {
                         x: x + (cell_width / 2.0),
                         y,
@@ -482,7 +482,7 @@ impl<'a> TerminalView<'a> {
                     indexed.c,
                     self.font.font_type(),
                     fg,
-                ));
+                )));
             }
         }
 
@@ -613,14 +613,14 @@ fn push_terminal_line(
         if ch == ' ' || ch == '\t' {
             continue;
         }
-        shapes.push(Shape::text(
-            &painter.fonts(|fonts| fonts.clone()),
+        shapes.push(painter.fonts_mut(|fonts| Shape::text(
+            fonts,
             Pos2::new(x + index as f32 * cell_width + cell_width / 2.0, y),
             Align2::CENTER_TOP,
             ch,
             font.clone(),
             color,
-        ));
+        )));
     }
 }
 
