@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented here.
 
+## [0.2.0](https://github.com/arepresas/repterm/compare/v0.1.5...v0.2.0) (2026-11-24)
+
+
+### Features
+
+* selectable text, automatic copy and English UI ([#27](https://github.com/arepresas/repterm/issues/27)) ([c799f52](https://github.com/arepresas/repterm/commit/c799f52e89d0c7dc032da76bc97bfbe8515c552f))
+
 ## [0.1.5](https://github.com/arepresas/repterm/compare/v0.1.4...v0.1.5) (2026-11-24)
 
 
