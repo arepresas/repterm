@@ -13,6 +13,10 @@ mod tools;
 fn main() -> eframe::Result {
     env_logger::init();
 
+    // GUI launchers such as Nautilus provide no TERM. Shells need one to emit
+    // OSC titles, which repterm uses to track the active directory.
+    alacritty_terminal::tty::setup_env();
+
     let mut options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([900.0, 600.0])
