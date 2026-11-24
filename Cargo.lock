@@ -157,7 +157,32 @@ dependencies = [
  "rustix 1.1.6",
  "rustix-openpty",
  "serde",
- "signal-hook",
+ "signal-hook 0.3.18",
+ "unicode-width 0.2.3",
+ "vte",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "alacritty_terminal"
+version = "0.26.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bda177466b9524d59f1b12f0dd30b68696788e9992a7e959021c4a0ed96fcf59"
+dependencies = [
+ "base64 0.22.1",
+ "bitflags 2.13.2",
+ "home",
+ "libc",
+ "log",
+ "miow",
+ "parking_lot",
+ "piper",
+ "polling",
+ "regex-automata",
+ "rustix 1.1.6",
+ "rustix-openpty",
+ "serde",
+ "signal-hook 0.4.6",
  "unicode-width 0.2.3",
  "vte",
  "windows-sys 0.59.0",
@@ -1061,7 +1086,7 @@ dependencies = [
 name = "egui_term"
 version = "0.1.0"
 dependencies = [
- "alacritty_terminal",
+ "alacritty_terminal 0.25.1",
  "anyhow",
  "egui",
  "open",
@@ -2865,7 +2890,7 @@ checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 name = "repterm"
 version = "0.1.0"
 dependencies = [
- "alacritty_terminal",
+ "alacritty_terminal 0.26.0",
  "arboard",
  "eframe",
  "egui",
@@ -3107,6 +3132,16 @@ name = "signal-hook"
 version = "0.3.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d881a16cf4426aa584979d30bd82cb33429027e42122b169753d6ef1085ed6e2"
+dependencies = [
+ "libc",
+ "signal-hook-registry",
+]
+
+[[package]]
+name = "signal-hook"
+version = "0.4.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "49f7447afd772ca79ad17ae0a3972a6b0df0cb4b80990fd82707593e9e012a74"
 dependencies = [
  "libc",
  "signal-hook-registry",
