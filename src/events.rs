@@ -13,7 +13,7 @@ pub enum Action {
     LoadClipboard(ClipboardType, Arc<dyn Fn(&str) -> String + Sync + Send>),
     RespondColor(usize, Arc<dyn Fn(Rgb) -> String + Sync + Send>),
     RespondSize(Arc<dyn Fn(WindowSize) -> String + Sync + Send>),
-    ChildExited(i32),
+    ChildExited(Option<i32>),
     Ignore,
 }
 
@@ -27,7 +27,7 @@ pub fn classify(event: &PtyEvent) -> Action {
         PtyEvent::ClipboardLoad(kind, formatter) => Action::LoadClipboard(*kind, formatter.clone()),
         PtyEvent::ColorRequest(index, formatter) => Action::RespondColor(*index, formatter.clone()),
         PtyEvent::TextAreaSizeRequest(formatter) => Action::RespondSize(formatter.clone()),
-        PtyEvent::ChildExit(code) => Action::ChildExited(*code),
+        PtyEvent::ChildExit(status) => Action::ChildExited(status.code()),
         _ => Action::Ignore,
     }
 }
@@ -35,6 +35,11 @@ pub fn classify(event: &PtyEvent) -> Action {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn exit_status(code: i32) -> std::process::ExitStatus {
+        std::os::unix::process::ExitStatusExt::from_raw(code)
+    }
 
     fn clipboard_formatter() -> Arc<dyn Fn(&str) -> String + Sync + Send> {
         Arc::new(|text| text.to_owned())
@@ -104,11 +109,12 @@ mod tests {
         assert!(matches!(classify(&event), Action::RespondSize(_)));
     }
 
+    #[cfg(unix)]
     #[test]
     fn child_exit_is_forwarded() {
         assert!(matches!(
-            classify(&PtyEvent::ChildExit(1)),
-            Action::ChildExited(1)
+            classify(&PtyEvent::ChildExit(exit_status(1 << 8))),
+            Action::ChildExited(Some(1))
         ));
     }
 

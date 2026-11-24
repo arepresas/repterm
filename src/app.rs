@@ -1039,7 +1039,7 @@ impl App {
         rows[2].1 = cwd;
         let mut decision = None;
 
-        let modal = egui::Modal::new(egui::Id::new("repterm-tool-permission")).show(ctx, |ui| {
+        let modal = egui::Modal::new(egui::Id::unique("repterm-tool-permission")).show(ctx, |ui| {
             ui.set_width(420.0);
             ui.strong(format!(
                 "Permiso solicitado: {} (pestaña {}, {} de {})",
@@ -1077,7 +1077,9 @@ impl App {
         }
     }
 
-    fn show_chat(&mut self, ctx: &egui::Context) {
+    fn show_chat(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let ctx = &ctx;
         let streaming = self.chat.rx.is_some();
         let turn_round = self.chat.turn.as_ref().map(|turn| turn.round);
         let busy = streaming || turn_round.is_some();
@@ -1089,9 +1091,9 @@ impl App {
         let mut insert: Option<String> = None;
         let composer_id = chat_composer_id();
 
-        egui::TopBottomPanel::top("chat_header")
-            .exact_height(34.0)
-            .show(ctx, |ui| {
+        egui::Panel::top("chat_header")
+            .exact_size(34.0)
+            .show(ui, |ui| {
                 ui.horizontal_centered(|ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
                     ui.strong("AI chat");
@@ -1129,7 +1131,7 @@ impl App {
                 });
             });
 
-        egui::TopBottomPanel::bottom("chat_composer").show(ctx, |ui| {
+        egui::Panel::bottom("chat_composer").show(ui, |ui| {
             ui.add_space(4.0);
             if streaming {
                 ui.horizontal(|ui| {
@@ -1180,7 +1182,7 @@ impl App {
             ui.add_space(4.0);
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             let visuals = ui.visuals().clone();
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
@@ -1190,7 +1192,7 @@ impl App {
                     let max_width = (ui.available_width() * 0.7).max(160.0);
                     for (index, message) in self.chat.messages.iter().enumerate() {
                         if message.role == Role::Tool {
-                            let id = egui::Id::new(("tool-result", index));
+                            let id = egui::Id::unique(("tool-result", index));
                             let expanded =
                                 ui.memory(|m| m.data.get_temp::<bool>(id).unwrap_or(false));
                             ui.horizontal(|ui| {
@@ -1423,7 +1425,9 @@ impl App {
         }
     }
 
-    fn show_changes(&mut self, ctx: &egui::Context) {
+    fn show_changes(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let ctx = &ctx;
         let Some(id) = self.tabs.active() else {
             return;
         };
@@ -1467,10 +1471,10 @@ impl App {
 
         let mut close = false;
         let mut pick = None;
-        egui::SidePanel::right("changes")
-            .default_width(360.0)
-            .width_range(280.0..=560.0)
-            .show(ctx, |ui| {
+        egui::Panel::right("changes")
+            .default_size(360.0)
+            .size_range(280.0..=560.0)
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.strong("Uncommitted changes");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1657,7 +1661,7 @@ fn apply_action(action: Action, ctx: &egui::Context, tab_id: u64, tabs: &mut Tab
             }
         }
         Action::ChildExited(code) => {
-            log::debug!("tab {tab_id} shell exited with code {code}");
+            log::debug!("tab {tab_id} shell exited with code {code:?}");
         }
         Action::Ignore => {}
     }
@@ -1673,7 +1677,7 @@ fn read_clipboard() -> Result<String, arboard::Error> {
 }
 
 fn foreground_color(ctx: &egui::Context) -> Rgb {
-    let color = ctx.style().visuals.text_color();
+    let color = ctx.global_style().visuals.text_color();
     Rgb {
         r: color.r(),
         g: color.g(),
@@ -1734,7 +1738,7 @@ fn files_noun(count: usize) -> &'static str {
 }
 
 fn chat_composer_id() -> egui::Id {
-    egui::Id::new("chat_composer_input")
+    egui::Id::unique("chat_composer_input")
 }
 
 fn blink(ui: &egui::Ui) -> bool {
@@ -1970,9 +1974,9 @@ fn chip(ui: &mut egui::Ui, job: egui::text::LayoutJob) -> egui::Response {
 }
 
 /// Draws the git chip bar; returns (branch chip clicked, changes chip clicked).
-fn show_repo_bar(ctx: &egui::Context, repo: &RepoStatus) -> (bool, bool) {
+fn show_repo_bar(ui: &mut egui::Ui, repo: &RepoStatus) -> (bool, bool) {
     let mut clicks = (false, false);
-    egui::TopBottomPanel::top("git").show(ctx, |ui| {
+    egui::Panel::top("git").show(ui, |ui| {
         ui.horizontal(|ui| {
             let text = ui.visuals().text_color();
             if let Some(git) = &repo.git {
@@ -2020,7 +2024,9 @@ fn ctrl_backspace_bindings() -> Vec<(Binding<InputKind>, BindingAction)> {
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        let ctx = &ctx;
         if ctx.input(|i| i.viewport().close_requested()) {
             self.tabs.clear();
         }
@@ -2105,7 +2111,7 @@ impl eframe::App for App {
             }
         }
 
-        egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
+        egui::Panel::top("tabs").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
                 for id in self.tabs.ids() {
@@ -2129,7 +2135,7 @@ impl eframe::App for App {
         });
 
         if let Some(repo) = self.repo.clone().filter(|repo| repo.git.is_some()) {
-            let (branch, changes) = show_repo_bar(ctx, &repo);
+            let (branch, changes) = show_repo_bar(ui, &repo);
             if branch {
                 self.open_picker(ctx);
             }
@@ -2145,7 +2151,7 @@ impl eframe::App for App {
             .active()
             .is_some_and(|id| self.changes.get(&id).is_some_and(|state| state.open))
         {
-            self.show_changes(ctx);
+            self.show_changes(ui);
         }
         self.show_picker(ctx);
 
@@ -2156,7 +2162,7 @@ impl eframe::App for App {
 
         self.show_permission(ctx);
         if self.chat_open {
-            self.show_chat(ctx);
+            self.show_chat(ui);
         } else {
             let mut inline_question = None;
             let mut bang_draft = None;
@@ -2166,7 +2172,7 @@ impl eframe::App for App {
             } else {
                 Vec::new()
             };
-            egui::CentralPanel::default().show(ctx, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 if let Some(tab) = self.tabs.active_tab_mut() {
                     let size = ui.available_size();
                     let terminal = TerminalView::new(ui, &mut tab.backend)
