@@ -66,8 +66,20 @@ jobs:
           root="${RUNNER_TEMP}/repterm-deb"
           mkdir -p dist
           rm -rf "$root"
-          mkdir -p "$root/DEBIAN" "$root/usr/bin" "$root/usr/share/doc/repterm"
-          cp "target/${{ matrix.target }}/release/repterm" "$root/usr/bin/repterm"
+          mkdir -p "$root/DEBIAN" "$root/usr/bin" "$root/usr/lib/repterm" "$root/usr/share/doc/repterm"
+          cp "target/${{ matrix.target }}/release/repterm" "$root/usr/lib/repterm/repterm"
+          chmod 755 "$root/usr/lib/repterm/repterm"
+          cat > "$root/usr/bin/repterm" <<'LAUNCHER'
+          #!/bin/sh
+          if ! zsh_path=$(command -v zsh 2>/dev/null) || [ -z "$zsh_path" ]; then
+            echo "repterm requiere zsh, pero no está instalado." >&2
+            echo "Instálalo con: sudo apt install zsh" >&2
+            exit 1
+          fi
+          SHELL="$zsh_path"
+          export SHELL
+          exec /usr/lib/repterm/repterm "$@"
+          LAUNCHER
           chmod 755 "$root/usr/bin/repterm"
           cp README.md LICENSE "$root/usr/share/doc/repterm/"
           cat > "$root/DEBIAN/control" <<EOF
@@ -78,7 +90,7 @@ jobs:
           Architecture: amd64
           Maintainer: repterm maintainers <noreply@github.com>
           Homepage: https://github.com/${{ github.repository }}
-          Depends: libc6, libgcc-s1
+          Depends: libc6, libgcc-s1, zsh
           Description: Fast terminal emulator with an AI chat agent
            repterm is built with Rust, egui and egui_term, with git status,
            a branch and diff picker, and a LiteLLM-backed AI chat agent.
