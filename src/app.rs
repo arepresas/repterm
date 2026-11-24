@@ -316,7 +316,7 @@ pub struct App {
     agent_typed: String,
     agent_output_committed: bool,
     agent_history: Vec<String>,
-    pending_history_cleanup: Option<(u64, std::time::Instant)>,
+    pending_history_cleanup: Option<(u64, String, std::time::Instant)>,
     model_rx: Option<Receiver<Result<Vec<String>, String>>>,
     model_list: Option<Vec<String>>,
     model_error: Option<String>,
@@ -900,13 +900,15 @@ impl App {
         let Some(tab) = self.tabs.tab_mut(id) else {
             return;
         };
+        let needle = command.trim_end_matches(['\n', '\r']).to_owned();
         tab.backend
             .process_command(BackendCommand::Write(command.into_bytes()));
         self.pending_history_cleanup = Some((
             id,
-            std::time::Instant::now() + std::time::Duration::from_millis(150),
+            needle,
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
         ));
-        ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        ctx.request_repaint_after(std::time::Duration::from_millis(50));
     }
 
     fn commit_agent_output(&mut self) {
@@ -1898,6 +1900,28 @@ fn visible_terminal_line(line: &str) -> String {
         .collect()
 }
 
+/// Checks rendered terminal cells, grouped by display line, for an echoed
+/// command. Used to erase the shell-history helper only once it is on screen.
+fn display_contains_line<I, L>(cells: I, needle: &str) -> bool
+where
+    I: Iterator<Item = (L, char)>,
+    L: PartialEq + Copy,
+{
+    let mut current = String::new();
+    let mut line = None;
+    for (cell_line, ch) in cells {
+        if Some(cell_line) != line {
+            if current.contains(needle) {
+                return true;
+            }
+            current.clear();
+            line = Some(cell_line);
+        }
+        current.push(ch);
+    }
+    current.contains(needle)
+}
+
 fn is_bare_bang(input: &str) -> bool {
     input.trim() == "!"
 }
@@ -2083,8 +2107,30 @@ impl eframe::App for App {
         self.poll_chat(ctx);
         self.commit_agent_output();
 
-        if let Some((id, at)) = self.pending_history_cleanup {
-            if std::time::Instant::now() >= at {
+        let cleanup_due = self
+            .pending_history_cleanup
+            .as_ref()
+            .is_some_and(|(_, _, deadline)| std::time::Instant::now() >= *deadline);
+        if cleanup_due {
+            self.pending_history_cleanup = None;
+        } else if let Some((id, needle)) = self
+            .pending_history_cleanup
+            .as_ref()
+            .map(|(id, needle, _)| (*id, needle.clone()))
+        {
+            let echoed = if let Some(tab) = self.tabs.tab_mut(id) {
+                let content = tab.backend.last_content();
+                display_contains_line(
+                    content
+                        .grid
+                        .display_iter()
+                        .map(|cell| (cell.point.line, cell.c)),
+                    &needle,
+                )
+            } else {
+                false
+            };
+            if echoed {
                 self.pending_history_cleanup = None;
                 if let Some(tab) = self.tabs.tab_mut(id) {
                     tab.backend.inject_output(b"\x1b[1A\x1b[2K\x1b[1B");
@@ -2283,11 +2329,11 @@ fn permission_pending(turn: Option<&ToolTurn>) -> bool {
 mod tests {
     use super::{
         agent_tab_is_active, apply_permission, bang_command, build_context, classify_diff_line,
-        clear_tool_turn, clip_title, command_target, ctrl_backspace_bindings, files_noun,
-        is_bare_bang, matches_query, new_tool_turn, next_tool_action, permission_pending,
-        permission_rows, push_tool_results, should_commit_agent_output, tab_label, ChatState,
-        DiffLine, PermissionDecision, PermissionKey, PermissionRequest, SettingsForm, ToolAction,
-        ToolName, ToolTurn,
+        clear_tool_turn, clip_title, command_target, ctrl_backspace_bindings,
+        display_contains_line, files_noun, is_bare_bang, matches_query, new_tool_turn,
+        next_tool_action, permission_pending, permission_rows, push_tool_results,
+        should_commit_agent_output, tab_label, ChatState, DiffLine, PermissionDecision,
+        PermissionKey, PermissionRequest, SettingsForm, ToolAction, ToolName, ToolTurn,
     };
     use crate::llm::{ChatMessage, Role};
     use crate::tools::{ToolCall, ToolOutcome};
@@ -2295,6 +2341,35 @@ mod tests {
     use std::collections::HashSet;
 
     use std::path::PathBuf;
+
+    #[test]
+    fn display_contains_line_finds_echoed_history_helper() {
+        let cells = vec![
+            (0, 'p'),
+            (0, 'r'),
+            (0, 'o'),
+            (0, 'm'),
+            (0, 'p'),
+            (0, 't'),
+            (1, ' '),
+            (1, 'p'),
+            (1, 'r'),
+            (1, 'i'),
+            (1, 'n'),
+            (1, 't'),
+            (1, ' '),
+            (1, '-'),
+            (1, 's'),
+            (1, ' '),
+            (1, '-'),
+            (1, '-'),
+        ];
+        assert!(display_contains_line(cells.into_iter(), "print -s --"));
+        assert!(!display_contains_line(
+            vec![(0, 'x'), (1, 'y')].into_iter(),
+            "print -s --"
+        ));
+    }
 
     #[test]
     fn agent_mode_is_only_active_on_its_originating_tab() {
