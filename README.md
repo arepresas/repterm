@@ -62,6 +62,16 @@ for the branch, its number and state are shown; clicking opens it in the
 browser. GitHub integration uses the `gh` CLI and requires it to be installed
 and authenticated.
 
+## Install on Ubuntu
+
+Download the `.deb` for `amd64` from the [latest release](https://github.com/arepresas/repterm/releases/latest) and install it with:
+
+```bash
+sudo apt install ./repterm_*_amd64.deb
+```
+
+The package installs `/usr/bin/repterm`. The `.tar.gz` archives are still published alongside it for other distributions and architectures.
+
 ## Build and run
 
 ```bash
