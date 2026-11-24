@@ -45,14 +45,10 @@ A weekly `cargo audit` job runs outside the PR gate and opens a `security` issue
 
 ## Releases
 
-1. Bump `version` in `Cargo.toml`.
-2. Commit with `chore(release): bump version to X.Y.Z`.
-3. Create and push an annotated tag:
+Releases come from `main`. Do not create tags by hand.
 
-```bash
-git tag -a vX.Y.Z -m "Release vX.Y.Z"
-git push origin main
-git push origin vX.Y.Z
-```
+`release-please` opens a Release PR when releasable commits (`feat`, `fix`, or breaking) land on `main`. That PR bumps `Cargo.toml`, updates `CHANGELOG.md` and `Cargo.lock`, and is titled `chore(release): release X.Y.Z`. Merge it yourself. Nothing is tagged or published until that merge.
 
-Pushing the tag triggers `release.yml`: it generates release notes with git-cliff, builds release binaries for Linux, macOS and Windows, and publishes a GitHub Release with checksums. The in-repo `CHANGELOG.md` is updated separately in a normal PR. Tags containing `-beta` or `-rc` are marked as prereleases.
+While the version is below `1.0.0`, `feat` bumps minor, `fix` bumps patch, and a breaking change bumps minor. Only stable `vX.Y.Z` releases are published.
+
+Merging the Release PR makes the same workflow build Linux, macOS and Windows binaries and upload them, with `README`, `LICENSE` and `SHA256SUMS`, to the GitHub Release. It does not publish to crates.io.
