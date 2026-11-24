@@ -8,6 +8,7 @@ mod llm;
 mod settings;
 mod shell;
 mod tabs;
+mod tools;
 
 fn main() -> eframe::Result {
     env_logger::init();

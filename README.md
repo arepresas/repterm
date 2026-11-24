@@ -11,7 +11,7 @@ A fast, simple terminal emulator built with Rust, egui, and egui_term.
 - AI chat mode backed by a LiteLLM proxy, with streaming answers and repository context
 - Proposed commands are inserted into the terminal by hand — nothing is executed automatically
 - OSC 52 clipboard support
-- Configurable shell via the `SHELL` environment variable
+- Configurable shell via the `SHELL` environment variable (Oh My Zsh recommended — see [Shell setup](#shell-setup-oh-my-zsh))
 
 ## Controls
 
@@ -65,6 +65,41 @@ and authenticated.
 cargo build
 cargo run
 ```
+
+## Shell setup: Oh My Zsh
+
+Each tab runs your `$SHELL`, so using zsh with Oh My Zsh is the recommended way
+to get completions, shared history and plugins inside repterm. Install it with:
+
+```bash
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)"
+```
+
+Two useful additions are `zsh-autosuggestions` and `zsh-syntax-highlighting`:
+
+```bash
+git clone https://github.com/zsh-users/zsh-autosuggestions ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/zsh-autosuggestions
+git clone https://github.com/zsh-users/zsh-syntax-highlighting ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting
+```
+
+Then enable them in `~/.zshrc`:
+
+```zsh
+plugins=(git zsh-autosuggestions zsh-syntax-highlighting)
+ZSH_THEME="robbyrussell"
+```
+
+Start repterm with `SHELL=/bin/zsh cargo run` (or export `SHELL=/bin/zsh` in your
+login shell) so new tabs pick it up. A few things to keep in mind:
+
+- repterm already shows branch, dirty state and PR status in its status bar.
+  Prefer a lightweight theme or disable the git segment in your prompt to avoid
+  showing the same information twice.
+- A `!` at the start of a clean line opens the AI chat; elsewhere it is left to
+  zsh history expansion, so commands like `git show HEAD!` still behave normally.
+- Oh My Zsh aliases and tab completion work as usual because they run inside the
+  tab's PTY. Stick to ASCII-only prompt symbols unless you configure a font with
+  the glyphs you need.
 
 ## Tests
 

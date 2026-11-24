@@ -1,5 +1,5 @@
-use crate::shell::resolve_shell;
-use egui_term::{BackendSettings, PtyEvent, TerminalBackend};
+use crate::shell::{history_setup_command, resolve_shell, shell_args};
+use egui_term::{BackendCommand, BackendSettings, PtyEvent, TerminalBackend};
 use std::collections::BTreeMap;
 use std::sync::mpsc::{self, Receiver, Sender};
 
@@ -39,7 +39,8 @@ impl Tabs {
             ctx.clone(),
             self.sender.clone(),
             BackendSettings {
-                shell,
+                args: shell_args(&shell),
+                shell: shell.clone(),
                 ..Default::default()
             },
         )
@@ -51,13 +52,15 @@ impl Tabs {
         })?;
 
         self.next_id += 1;
-        self.entries.insert(
-            id,
-            Tab {
-                backend,
-                title: format!("shell {id}"),
-            },
-        );
+        let mut tab = Tab {
+            backend,
+            title: format!("shell {id}"),
+        };
+        if let Some(setup) = history_setup_command(&shell) {
+            tab.backend
+                .process_command(BackendCommand::Write(setup.into_bytes()));
+        }
+        self.entries.insert(id, tab);
         self.active = Some(id);
         Ok(id)
     }
