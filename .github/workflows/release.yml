@@ -54,6 +54,37 @@ jobs:
           key: ${{ matrix.target }}
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
+      - name: Build Debian package
+        if: matrix.os == 'ubuntu-22.04'
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.release-please.outputs.version }}
+        run: |
+          set -euo pipefail
+          version="$RELEASE_VERSION"
+          deb="repterm_${version}_amd64.deb"
+          root="${RUNNER_TEMP}/repterm-deb"
+          mkdir -p dist
+          rm -rf "$root"
+          mkdir -p "$root/DEBIAN" "$root/usr/bin" "$root/usr/share/doc/repterm"
+          cp "target/${{ matrix.target }}/release/repterm" "$root/usr/bin/repterm"
+          chmod 755 "$root/usr/bin/repterm"
+          cp README.md LICENSE "$root/usr/share/doc/repterm/"
+          cat > "$root/DEBIAN/control" <<EOF
+          Package: repterm
+          Version: ${version}
+          Section: utils
+          Priority: optional
+          Architecture: amd64
+          Maintainer: repterm maintainers <noreply@github.com>
+          Homepage: https://github.com/${{ github.repository }}
+          Depends: libc6, libgcc-s1
+          Description: Fast terminal emulator with an AI chat agent
+           repterm is built with Rust, egui and egui_term, with git status,
+           a branch and diff picker, and a LiteLLM-backed AI chat agent.
+          EOF
+          dpkg-deb --build --root-owner-group "$root" "dist/$deb"
+          (cd dist && sha256sum "$deb" > "$deb.sha256")
       - name: Package (unix)
         if: matrix.os != 'windows-latest'
         shell: bash
