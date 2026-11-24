@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented here.
 
+## 0.1.0 (2026-11-24)
+
+
+### Features
+
+* add git status, branch picker and diff panel ([2284f7a](https://github.com/arepresas/repterm/commit/2284f7a32958ec3357f8ef5e5911d3cd43df37d5))
+* add scoped filesystem tools and inline agent UX ([71d6739](https://github.com/arepresas/repterm/commit/71d673931b73904bc1bebaec0e474408c2354db3))
+
 ## [unreleased]
 
 ### Added
