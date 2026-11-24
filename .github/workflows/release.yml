@@ -69,6 +69,7 @@ jobs:
           cp README.md LICENSE "$stage/"
           tar -czf "dist/${asset}" -C dist "${asset%.tar.gz}"
           (cd dist && sha256sum "${asset}" > "${asset}.sha256")
+          rm -rf "$stage"
       - name: Package (windows)
         if: matrix.os == 'windows-latest'
         shell: pwsh
@@ -84,6 +85,7 @@ jobs:
           Compress-Archive -Path $stage -DestinationPath "dist/$asset"
           $hash = (Get-FileHash "dist/$asset" -Algorithm SHA256).Hash.ToLower()
           "$hash  $asset" | Set-Content "dist/$asset.sha256"
+          Remove-Item -Recurse -Force $stage
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: repterm-${{ matrix.target }}
@@ -110,4 +112,18 @@ jobs:
       - name: Upload release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${{ needs.release-please.outputs.tag_name }}" dist/* --clobber --repo "${{ github.repository }}"
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(dist/*)
+          upload=()
+          for f in "${files[@]}"; do
+            if [ -f "$f" ]; then
+              upload+=("$f")
+            fi
+          done
+          if [ ${#upload[@]} -eq 0 ]; then
+            echo "No release files to upload" >&2
+            exit 1
+          fi
+          gh release upload "${{ needs.release-please.outputs.tag_name }}" "${upload[@]}" --clobber --repo "${{ github.repository }}"
