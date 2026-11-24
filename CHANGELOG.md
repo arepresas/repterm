@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented here.
 
+## [0.1.4](https://github.com/arepresas/repterm/compare/v0.1.3...v0.1.4) (2026-11-24)
+
+
+### Bug Fixes
+
+* **release:** ignore staging dirs in asset upload ([3fc0d10](https://github.com/arepresas/repterm/commit/3fc0d104bb8b6294cb706977cc063c0193dfcca3))
+
 ## [0.1.3](https://github.com/arepresas/repterm/compare/v0.1.2...v0.1.3) (2026-11-24)
 
 
