@@ -6,7 +6,7 @@ use crate::gitinfo::{
 };
 use crate::llm::{build_messages, ChatMessage, LlmClient, Role, StreamUpdate};
 use crate::settings::{self, Settings};
-use crate::shell::{history_add_command, history_entry_text, resolve_shell};
+use crate::shell::history_entry_text;
 use crate::tabs::Tabs;
 use crate::tools::{
     execute, is_within, tool_definitions, PermissionKey, ToolCall, ToolName, ToolOutcome,
@@ -116,11 +116,10 @@ impl ChatState {
 }
 
 fn new_tool_turn(tab_id: Option<u64>, cwd: Option<&str>) -> Result<ToolTurn, String> {
-    let tab_id =
-        tab_id.ok_or_else(|| "No hay pestaña activa para ejecutar herramientas".to_owned())?;
-    let raw = cwd.ok_or_else(|| "No se conoce el directorio de la pestaña activa".to_owned())?;
+    let tab_id = tab_id.ok_or_else(|| "No active tab to run tools".to_owned())?;
+    let raw = cwd.ok_or_else(|| "Active tab directory is unknown".to_owned())?;
     let cwd = std::fs::canonicalize(raw)
-        .map_err(|err| format!("No se pudo resolver el directorio activo: {err}"))?;
+        .map_err(|err| format!("Could not resolve the active directory: {err}"))?;
     Ok(ToolTurn {
         tab_id,
         cwd,
@@ -231,10 +230,10 @@ fn settle_tool_turn(chat: &mut ChatState, pending: &str) {
 
 fn permission_rows(request: &PermissionRequest) -> [(&'static str, String); 4] {
     [
-        ("Herramienta", request.call.name.clone()),
-        ("Ruta", request.key.path.display().to_string()),
-        ("Directorio de la pestaña", String::new()),
-        ("Motivo", request.reason.clone()),
+        ("Tool", request.call.name.clone()),
+        ("Path", request.key.path.display().to_string()),
+        ("Tab directory", String::new()),
+        ("Reason", request.reason.clone()),
     ]
 }
 
@@ -317,12 +316,12 @@ pub struct App {
     agent_typed: String,
     agent_output_committed: bool,
     agent_history: Vec<String>,
-    pending_history_cleanup: Option<(u64, std::time::Instant)>,
     model_rx: Option<Receiver<Result<Vec<String>, String>>>,
     model_list: Option<Vec<String>>,
     model_error: Option<String>,
     models_loading: bool,
     allowed_tools: HashSet<PermissionKey>,
+    copy_toast: Option<std::time::Instant>,
 }
 
 impl App {
@@ -363,12 +362,12 @@ impl App {
             agent_typed: String::new(),
             agent_output_committed: false,
             agent_history: Vec::new(),
-            pending_history_cleanup: None,
             model_rx: None,
             model_list: None,
             model_error: None,
             models_loading: false,
             allowed_tools: HashSet::new(),
+            copy_toast: None,
         })
     }
 
@@ -441,7 +440,7 @@ impl App {
         let loading = self.models_loading;
         let model_error = self.model_error.clone();
 
-        egui::Window::new("Ajustes")
+        egui::Window::new("Settings")
             .resizable(false)
             .default_size(egui::vec2(460.0, 340.0))
             .open(&mut self.settings_open)
@@ -465,10 +464,10 @@ impl App {
                     .show(ui);
 
                 ui.horizontal(|ui| {
-                    ui.label("Modelo");
+                    ui.label("Model");
                     if ui
                         .small_button("↻")
-                        .on_hover_text("Recargar modelos")
+                        .on_hover_text("Reload models")
                         .clicked()
                     {
                         action = SettingsAction::Refresh;
@@ -498,26 +497,26 @@ impl App {
                     });
                 ui.text_edit_singleline(&mut form.model);
                 if loading {
-                    ui.weak("Cargando modelos…");
+                    ui.weak("Loading models…");
                 }
                 if let Some(err) = &model_error {
-                    ui.colored_label(WARN_COLOR, "Modelos no disponibles")
+                    ui.colored_label(WARN_COLOR, "No models available")
                         .on_hover_text(err);
-                    if ui.small_button("Reintentar").clicked() {
+                    if ui.small_button("Retry").clicked() {
                         action = SettingsAction::Refresh;
                     }
                 }
 
-                ui.checkbox(&mut include, "Incluir contexto del terminal");
-                ui.weak("Incluye selección y últimas líneas. Puede contener secretos.");
+                ui.checkbox(&mut include, "Include terminal context");
+                ui.weak("Includes the selection and latest lines. May contain secrets.");
                 if !save_error.is_empty() {
                     ui.colored_label(DEL_COLOR, &save_error);
                 }
                 ui.horizontal(|ui| {
-                    if ui.button("Guardar").clicked() {
+                    if ui.button("Save").clicked() {
                         action = SettingsAction::Save;
                     }
-                    if ui.button("Cancelar").clicked() {
+                    if ui.button("Cancel").clicked() {
                         action = SettingsAction::Cancel;
                     }
                 });
@@ -633,14 +632,14 @@ impl App {
         // it before starting another question so no tool call is left unanswered.
         settle_tool_turn(
             &mut self.chat,
-            "El usuario inició otra pregunta; no se ejecutó.",
+            "The user started another question, so it was not run.",
         );
         if self.settings.base_url.trim().is_empty() {
-            self.chat.error = Some("Configura la Base URL en Ajustes".to_owned());
+            self.chat.error = Some("Configure the base URL in Settings".to_owned());
             return;
         }
         if self.settings.model.trim().is_empty() {
-            self.chat.error = Some("Configura un modelo en Ajustes".to_owned());
+            self.chat.error = Some("Configure a model in Settings".to_owned());
             return;
         }
         let turn = match new_tool_turn(self.tabs.active(), self.active_cwd().as_deref()) {
@@ -734,13 +733,10 @@ impl App {
                     .push(ChatMessage::assistant_tool_calls(calls));
                 self.chat.partial.clear();
                 if disconnected && self.chat.error.is_none() {
-                    self.chat.error = Some("La conexión terminó inesperadamente".to_owned());
+                    self.chat.error = Some("The connection ended unexpectedly".to_owned());
                 }
                 if disconnected {
-                    settle_tool_turn(
-                        &mut self.chat,
-                        "La conexión terminó antes de ejecutar esta herramienta.",
-                    );
+                    settle_tool_turn(&mut self.chat, "The connection ended before this tool ran.");
                     self.chat.cancelled = false;
                     return;
                 }
@@ -752,7 +748,7 @@ impl App {
                 self.chat.messages.push(ChatMessage::assistant(partial));
             }
             if disconnected && self.chat.error.is_none() {
-                self.chat.error = Some("La conexión terminó inesperadamente".to_owned());
+                self.chat.error = Some("The connection ended unexpectedly".to_owned());
             }
             self.chat.cancelled = false;
             clear_tool_turn(&mut self.chat);
@@ -794,11 +790,11 @@ impl App {
         push_tool_results(
             &mut self.chat,
             &turn,
-            "El usuario denegó esta operación; no se ejecutó el resto de la ronda.",
+            "The user denied this operation; the rest of the round was not run.",
         );
         if turn.round >= MAX_TOOL_ROUNDS {
             self.chat.messages.push(ChatMessage::assistant(format!(
-                "Se alcanzó el límite de {MAX_TOOL_ROUNDS} rondas de herramientas."
+                "Reached the limit of {MAX_TOOL_ROUNDS} tool rounds."
             )));
             return;
         }
@@ -826,7 +822,7 @@ impl App {
     fn cancel_chat(&mut self, ctx: &egui::Context) {
         settle_tool_turn(
             &mut self.chat,
-            "El usuario canceló esta herramienta; no se ejecutó.",
+            "The user cancelled this tool, so it was not run.",
         );
         let Some(rx) = self.chat.rx.take() else {
             return;
@@ -880,35 +876,11 @@ impl App {
         self.agent_output_committed = false;
         self.agent_typed = typed.trim().to_owned();
         self.chat.input = question.to_owned();
-        self.record_inline_history(typed.trim(), ctx);
-        self.send_chat(ctx, false);
-    }
-
-    /// Puts the question in the shell's own history so Up recalls it alongside
-    /// real commands. The helper line is echoed by the PTY, so schedule a
-    /// display-only erase once the shell has consumed it.
-    fn record_inline_history(&mut self, question: &str, ctx: &egui::Context) {
-        let shell = resolve_shell(std::env::var("SHELL").ok().as_deref());
-        let Some(command) = history_add_command(&shell, question) else {
-            return;
-        };
-        let entry = history_entry_text(question);
+        let entry = history_entry_text(typed.trim());
         if self.agent_history.last() != Some(&entry) {
             self.agent_history.push(entry);
         }
-        let Some(id) = self.tabs.active() else {
-            return;
-        };
-        let Some(tab) = self.tabs.tab_mut(id) else {
-            return;
-        };
-        tab.backend
-            .process_command(BackendCommand::Write(command.into_bytes()));
-        self.pending_history_cleanup = Some((
-            id,
-            std::time::Instant::now() + std::time::Duration::from_millis(150),
-        ));
-        ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        self.send_chat(ctx, false);
     }
 
     fn commit_agent_output(&mut self) {
@@ -961,7 +933,7 @@ impl App {
         }
         if text.starts_with('!') {
             if text.contains(['\n', '\r']) {
-                self.chat.error = Some("Los comandos ! deben ocupar una sola línea".to_owned());
+                self.chat.error = Some("! commands must fit on one line".to_owned());
                 return;
             }
             if let Some(command) = bang_command(&text) {
@@ -974,11 +946,11 @@ impl App {
 
     fn run_bang(&mut self, command: &str, ctx: &egui::Context) {
         let Ok(id) = command_target(self.tabs.active()) else {
-            self.chat.error = Some("No hay pestaña activa para ejecutar el comando".to_owned());
+            self.chat.error = Some("No active tab to run the command".to_owned());
             return;
         };
         let Some(tab) = self.tabs.tab_mut(id) else {
-            self.chat.error = Some("No hay pestaña activa para ejecutar el comando".to_owned());
+            self.chat.error = Some("No active tab to run the command".to_owned());
             return;
         };
         tab.backend
@@ -994,7 +966,7 @@ impl App {
 
     fn insert_command(&mut self, text: &str, ctx: &egui::Context) {
         let Ok(id) = command_target(self.tabs.active()) else {
-            self.chat.error = Some("No hay pestaña activa para insertar el comando".to_owned());
+            self.chat.error = Some("No active tab to insert the command".to_owned());
             return;
         };
         if let Some(tab) = self.tabs.tab_mut(id) {
@@ -1027,6 +999,49 @@ impl App {
             .unwrap_or_default()
     }
 
+    /// Selectable labels emit `TextSelectionSettled` when the user finishes a
+    /// drag; the vendored terminal reuses the same command. Copy its text once
+    /// here and show a short confirmation.
+    fn take_copy_commands(&mut self, ctx: &egui::Context) {
+        let commands = ctx.output_mut(|output| std::mem::take(&mut output.commands));
+        for command in commands {
+            if let egui::OutputCommand::TextSelectionSettled(text) = command {
+                if text.trim().is_empty() {
+                    continue;
+                }
+                ctx.copy_text(text);
+                self.copy_toast = Some(std::time::Instant::now());
+                ctx.request_repaint();
+            }
+        }
+    }
+
+    fn show_copy_toast(&mut self, ctx: &egui::Context) {
+        const TOAST_SECONDS: f64 = 2.0;
+        let Some(at) = self.copy_toast else {
+            return;
+        };
+        if at.elapsed().as_secs_f64() >= TOAST_SECONDS {
+            self.copy_toast = None;
+            ctx.request_repaint();
+            return;
+        }
+        ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        egui::Area::new(egui::Id::unique("repterm-copy-toast"))
+            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-14.0, -14.0))
+            .interactable(false)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(ui.visuals().widgets.noninteractive.bg_fill)
+                    .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+                    .corner_radius(6.0)
+                    .inner_margin(egui::Margin::symmetric(12, 8))
+                    .show(ui, |ui| {
+                        ui.label("Copied to clipboard");
+                    });
+            });
+    }
+
     fn show_permission(&mut self, ctx: &egui::Context) {
         let Some(turn) = self.chat.turn.as_ref() else {
             return;
@@ -1042,7 +1057,7 @@ impl App {
         let modal = egui::Modal::new(egui::Id::unique("repterm-tool-permission")).show(ctx, |ui| {
             ui.set_width(420.0);
             ui.strong(format!(
-                "Permiso solicitado: {} (pestaña {}, {} de {})",
+                "Permission requested: {} (tab {}, {} of {})",
                 request.key.tool.as_str(),
                 turn.tab_id,
                 request.index,
@@ -1057,13 +1072,13 @@ impl App {
             }
             ui.separator();
             ui.horizontal(|ui| {
-                if ui.button("Permitir una vez").clicked() {
+                if ui.button("Allow once").clicked() {
                     decision = Some(PermissionDecision::AllowOnce);
                 }
-                if ui.button("Permitir siempre esta ruta").clicked() {
+                if ui.button("Always allow this path").clicked() {
                     decision = Some(PermissionDecision::AllowAlways);
                 }
-                if ui.button("Rechazar").clicked() {
+                if ui.button("Reject").clicked() {
                     decision = Some(PermissionDecision::Deny);
                 }
             });
@@ -1100,32 +1115,32 @@ impl App {
                     let (color, hint): (egui::Color32, String) = if self.chat.error.is_some() {
                         (DEL_COLOR, "error".to_owned())
                     } else if let Some(round) = turn_round {
-                        (WARN_COLOR, format!("ronda {round}/8"))
+                        (WARN_COLOR, format!("round {round}/8"))
                     } else if streaming {
                         (WARN_COLOR, "streaming".to_owned())
                     } else if self.settings.api_key.trim().is_empty() {
-                        (WARN_COLOR, "sin clave configurada".to_owned())
+                        (WARN_COLOR, "no API key configured".to_owned())
                     } else {
-                        (ADD_COLOR, "listo".to_owned())
+                        (ADD_COLOR, "ready".to_owned())
                     };
                     ui.colored_label(color, format!("● {hint}"));
                     let model = if self.settings.model.trim().is_empty() {
-                        "modelo no configurado"
+                        "no model configured"
                     } else {
                         self.settings.model.as_str()
                     };
                     ui.weak(model);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("×").on_hover_text("Cerrar chat").clicked() {
+                        if ui.small_button("×").on_hover_text("Close chat").clicked() {
                             close = true;
                         }
-                        if ui.small_button("Ajustes").clicked() {
+                        if ui.small_button("Settings").clicked() {
                             open_settings = true;
                         }
                         ui.weak(if self.settings.include_terminal_context {
-                            "Terminal incluido"
+                            "Terminal included"
                         } else {
-                            "Terminal excluido"
+                            "Terminal excluded"
                         });
                     });
                 });
@@ -1136,7 +1151,7 @@ impl App {
             if streaming {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.weak("Generando…");
+                    ui.weak("Generating…");
                 });
             }
             if let Some(error) = &self.chat.error {
@@ -1154,7 +1169,7 @@ impl App {
                     .font(egui::TextStyle::Monospace)
                     .desired_rows(3)
                     .desired_width(f32::INFINITY)
-                    .hint_text("Pregunta al agente o escribe !comando"),
+                    .hint_text("Ask the agent or type !command"),
             );
             if self.chat_focus {
                 composer.request_focus();
@@ -1163,20 +1178,20 @@ impl App {
             ui.horizontal(|ui| {
                 let can_send = !self.chat.input.trim().is_empty() && !busy;
                 if ui
-                    .add_enabled(can_send, egui::Button::new("Enviar"))
+                    .add_enabled(can_send, egui::Button::new("Send"))
                     .clicked()
                 {
                     submit = true;
                 }
                 if busy {
-                    if ui.button("Cancelar").clicked() {
+                    if ui.button("Cancel").clicked() {
                         cancel = true;
                     }
-                } else if self.chat.error.is_some() && ui.button("Reintentar").clicked() {
+                } else if self.chat.error.is_some() && ui.button("Retry").clicked() {
                     retry = true;
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.weak("Enter envía · Shift+Enter salto");
+                    ui.weak("Enter sends · Shift+Enter newline");
                 });
             });
             ui.add_space(4.0);
@@ -1196,8 +1211,16 @@ impl App {
                             let expanded =
                                 ui.memory(|m| m.data.get_temp::<bool>(id).unwrap_or(false));
                             ui.horizontal(|ui| {
-                                ui.monospace(chat_view::tool_result_summary(&message.content));
-                                if ui.button(if expanded { "Ocultar" } else { "Ver" }).clicked() {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(chat_view::tool_result_summary(
+                                            &message.content,
+                                        ))
+                                        .monospace(),
+                                    )
+                                    .selectable(true),
+                                );
+                                if ui.button(if expanded { "Hide" } else { "View" }).clicked() {
                                     ui.memory_mut(|m| m.data.insert_temp(id, !expanded));
                                 }
                             });
@@ -1208,7 +1231,7 @@ impl App {
                             chat_bubble(ui, message, max_width, &visuals);
                             if message.role == Role::Assistant {
                                 for block in chat_view::code_blocks(&message.content) {
-                                    if ui.small_button("Insertar en terminal").clicked() {
+                                    if ui.small_button("Insert into terminal").clicked() {
                                         insert = Some(block);
                                     }
                                 }
@@ -1223,7 +1246,7 @@ impl App {
                         ui.add_space(6.0);
                     }
                     if self.chat.cancelled {
-                        ui.weak("(cancelado)");
+                        ui.weak("(cancelled)");
                         ui.add_space(6.0);
                     }
                     if self.chat.messages.is_empty()
@@ -1233,7 +1256,7 @@ impl App {
                         ui.add_space(24.0);
                         ui.vertical_centered(|ui| {
                             ui.weak(
-                                "Pregunta sobre el repo o escribe !comando para ejecutarlo en el terminal.",
+                                "Ask about the repo or type !command to run it in the terminal.",
                             );
                         });
                     }
@@ -1804,7 +1827,7 @@ fn chat_bubble(ui: &mut egui::Ui, message: &ChatMessage, max_width: f32, visuals
         job.wrap.max_width = wrap_width;
         ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
             bubble_frame(ui, CHAT_ACCENT, max_width, |ui| {
-                ui.add(egui::Label::new(job));
+                ui.add(egui::Label::new(job).selectable(true));
             });
         });
     } else {
@@ -1815,7 +1838,7 @@ fn chat_bubble(ui: &mut egui::Ui, message: &ChatMessage, max_width: f32, visuals
             visuals.widgets.noninteractive.weak_bg_fill,
             max_width,
             |ui| {
-                ui.add(egui::Label::new(job));
+                ui.add(egui::Label::new(job).selectable(true));
             },
         );
     }
@@ -1829,7 +1852,7 @@ fn bubble_text(ui: &mut egui::Ui, text: &str, max_width: f32, visuals: &egui::Vi
         visuals.widgets.noninteractive.weak_bg_fill,
         max_width,
         |ui| {
-            ui.add(egui::Label::new(job));
+            ui.add(egui::Label::new(job).selectable(true));
         },
     );
 }
@@ -1874,15 +1897,15 @@ fn build_context(
     include_terminal: bool,
 ) -> String {
     let mut out = String::new();
-    out.push_str(&format!("Directorio: {}\n", cwd.unwrap_or("(desconocido)")));
+    out.push_str(&format!("Directory: {}\n", cwd.unwrap_or("(unknown)")));
     if let Some(repo) = repo {
         if let Some(git) = &repo.git {
-            out.push_str(&format!("Rama: {}\n", format_git_label(git)));
+            out.push_str(&format!("Branch: {}\n", format_git_label(git)));
         }
         if repo.changes.is_empty() {
-            out.push_str("Cambios pendientes: ninguno\n");
+            out.push_str("No pending changes\n");
         } else {
-            out.push_str("Cambios pendientes:\n");
+            out.push_str("Pending changes:\n");
             for file in &repo.changes {
                 let staged = if file.staged { "staged" } else { "unstaged" };
                 out.push_str(&format!(
@@ -1894,13 +1917,13 @@ fn build_context(
     }
     if include_terminal {
         if let Some(selection) = selection.map(str::trim).filter(|text| !text.is_empty()) {
-            out.push_str("Selección del terminal:\n");
+            out.push_str("Terminal selection:\n");
             out.push_str(&tail_chars(selection, MAX_TERMINAL_CONTEXT_CHARS));
             out.push('\n');
         }
         if !lines.is_empty() {
             let joined = lines.join("\n");
-            out.push_str("Últimas líneas del terminal:\n```\n");
+            out.push_str("Latest terminal lines:\n```\n");
             out.push_str(&tail_chars(&joined, MAX_TERMINAL_CONTEXT_CHARS));
             out.push_str("\n```\n");
         }
@@ -2034,15 +2057,6 @@ impl eframe::App for App {
         self.poll_chat(ctx);
         self.commit_agent_output();
 
-        if let Some((id, at)) = self.pending_history_cleanup {
-            if std::time::Instant::now() >= at {
-                self.pending_history_cleanup = None;
-                if let Some(tab) = self.tabs.tab_mut(id) {
-                    tab.backend.inject_output(b"\x1b[1A\x1b[2K\x1b[1B");
-                }
-            }
-        }
-
         let permission_pending = permission_pending(self.chat.turn.as_ref());
 
         let mut exit_agent = false;
@@ -2107,6 +2121,7 @@ impl eframe::App for App {
         let events: Vec<_> = self.tabs.try_iter().take(256).collect();
         for (id, event) in events {
             if apply_action(classify(&event), ctx, id, &mut self.tabs) {
+                self.take_copy_commands(ctx);
                 return;
             }
         }
@@ -2157,6 +2172,7 @@ impl eframe::App for App {
 
         if self.settings_open {
             self.show_settings(ctx);
+            self.take_copy_commands(ctx);
             return;
         }
 
@@ -2203,6 +2219,8 @@ impl eframe::App for App {
                 self.submit_inline_question(&question, ctx);
             }
         }
+        self.show_copy_toast(ctx);
+        self.take_copy_commands(ctx);
     }
 }
 
@@ -2411,7 +2429,7 @@ mod tests {
             total: 2,
         };
         let rows = permission_rows(&req);
-        assert_eq!(rows[0].0, "Herramienta");
+        assert_eq!(rows[0].0, "Tool");
         assert_eq!(rows[0].1, "read_file");
         assert_eq!(rows[1].1, "/etc/hosts");
         assert_eq!(rows[3].1, "diagnóstico");
