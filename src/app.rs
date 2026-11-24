@@ -6,13 +6,19 @@ use crate::gitinfo::{
 };
 use crate::llm::{build_messages, ChatMessage, LlmClient, Role, StreamUpdate};
 use crate::settings::{self, Settings};
+use crate::shell::{history_add_command, history_entry_text, resolve_shell};
 use crate::tabs::Tabs;
+use crate::tools::{
+    execute, is_within, tool_definitions, PermissionKey, ToolCall, ToolName, ToolOutcome,
+};
 use alacritty_terminal::event::WindowSize;
 use alacritty_terminal::term::ClipboardType;
 use alacritty_terminal::vte::ansi::Rgb;
 use egui_term::{
     BackendCommand, Binding, BindingAction, InputKind, TerminalBackend, TerminalMode, TerminalView,
 };
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
@@ -26,8 +32,62 @@ const DEL_COLOR: egui::Color32 = egui::Color32::from_rgb(0xe0, 0x6c, 0x6c);
 const WARN_COLOR: egui::Color32 = egui::Color32::from_rgb(0xd9, 0xa4, 0x41);
 const MAX_TERMINAL_CONTEXT_CHARS: usize = 8000;
 const MAX_CONTEXT_LINES: usize = 120;
+const MAX_TOOL_ROUNDS: usize = 8;
 
 type DiffKey = (String, String, bool, u32, u32);
+
+#[derive(Default)]
+struct ChangesState {
+    open: bool,
+    selected_file: Option<(String, bool)>,
+    diff_key: Option<DiffKey>,
+    diff_lines: Option<Vec<String>>,
+}
+
+#[derive(Clone)]
+pub struct PermissionRequest {
+    pub call: ToolCall,
+    pub key: PermissionKey,
+    pub reason: String,
+    pub index: usize,
+    pub total: usize,
+}
+
+pub struct ToolTurn {
+    pub tab_id: u64,
+    pub cwd: PathBuf,
+    pub round: usize,
+    pub calls: Vec<ToolCall>,
+    pub outcomes: Vec<ToolOutcome>,
+    pub next: usize,
+    pub permission: Option<PermissionRequest>,
+    /// Grants valid for the current call only; never copied to the session list.
+    pub once_allowed: HashSet<PermissionKey>,
+    pub stopped: bool,
+}
+
+impl ToolTurn {
+    /// A one-shot grant is spent by the call it was granted for, not by a
+    /// later identical call in the same turn.
+    fn consume_once(&mut self, call: &ToolCall) {
+        if let Some(key) = call_permission_key(call, &self.cwd) {
+            self.once_allowed.remove(&key);
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PermissionDecision {
+    AllowOnce,
+    AllowAlways,
+    Deny,
+}
+
+pub enum ToolAction {
+    Execute(ToolCall),
+    Ask(PermissionRequest),
+    Finish,
+}
 
 pub struct ChatState {
     pub messages: Vec<ChatMessage>,
@@ -37,6 +97,7 @@ pub struct ChatState {
     pub cancelled: bool,
     pub cancel: Arc<AtomicBool>,
     pub rx: Option<Receiver<StreamUpdate>>,
+    pub turn: Option<ToolTurn>,
 }
 
 impl ChatState {
@@ -49,8 +110,132 @@ impl ChatState {
             cancelled: false,
             cancel: Arc::new(AtomicBool::new(false)),
             rx: None,
+            turn: None,
         }
     }
+}
+
+fn new_tool_turn(tab_id: Option<u64>, cwd: Option<&str>) -> Result<ToolTurn, String> {
+    let tab_id =
+        tab_id.ok_or_else(|| "No hay pestaña activa para ejecutar herramientas".to_owned())?;
+    let raw = cwd.ok_or_else(|| "No se conoce el directorio de la pestaña activa".to_owned())?;
+    let cwd = std::fs::canonicalize(raw)
+        .map_err(|err| format!("No se pudo resolver el directorio activo: {err}"))?;
+    Ok(ToolTurn {
+        tab_id,
+        cwd,
+        round: 1,
+        calls: Vec::new(),
+        outcomes: Vec::new(),
+        next: 0,
+        permission: None,
+        once_allowed: HashSet::new(),
+        stopped: false,
+    })
+}
+
+fn call_path(call: &ToolCall) -> Option<String> {
+    let args: serde_json::Value = serde_json::from_str(&call.arguments).ok()?;
+    args.get("path")?.as_str().map(str::to_owned)
+}
+
+fn call_reason(call: &ToolCall) -> String {
+    serde_json::from_str::<serde_json::Value>(&call.arguments)
+        .ok()
+        .and_then(|value| value.get("reason")?.as_str().map(str::to_owned))
+        .unwrap_or_default()
+}
+
+fn call_permission_key(call: &ToolCall, cwd: &Path) -> Option<PermissionKey> {
+    let raw = call_path(call)?;
+    let path = crate::tools::resolve_path(&raw, cwd, std::env::var("HOME").ok().as_deref()).ok()?;
+    Some(PermissionKey {
+        tool: ToolName::from_str(&call.name).unwrap_or(ToolName::ReadFile),
+        path,
+    })
+}
+
+fn next_tool_action(turn: &ToolTurn, allowed: &HashSet<PermissionKey>) -> ToolAction {
+    if turn.stopped {
+        return ToolAction::Finish;
+    }
+    let Some(call) = turn.calls.get(turn.next) else {
+        return ToolAction::Finish;
+    };
+    let Some(key) = call_permission_key(call, &turn.cwd) else {
+        return ToolAction::Execute(call.clone());
+    };
+    if is_within(&key.path, &turn.cwd) || allowed.contains(&key) || turn.once_allowed.contains(&key)
+    {
+        ToolAction::Execute(call.clone())
+    } else {
+        ToolAction::Ask(PermissionRequest {
+            call: call.clone(),
+            key,
+            reason: call_reason(call),
+            index: turn.next + 1,
+            total: turn.calls.len(),
+        })
+    }
+}
+
+fn apply_permission(
+    turn: &mut ToolTurn,
+    allowed: &mut HashSet<PermissionKey>,
+    decision: PermissionDecision,
+) {
+    let Some(request) = turn.permission.take() else {
+        return;
+    };
+    match decision {
+        PermissionDecision::AllowOnce => {
+            turn.once_allowed.insert(request.key);
+        }
+        PermissionDecision::AllowAlways => {
+            allowed.insert(request.key);
+        }
+        PermissionDecision::Deny => {
+            turn.stopped = true;
+        }
+    }
+}
+
+fn clear_tool_turn(chat: &mut ChatState) {
+    chat.turn = None;
+}
+
+/// Answers every tool call already announced to the model, keeping all
+/// `tool` messages contiguous right after the `assistant` tool-call message.
+/// Anthropic-family providers reject a `tool_use` whose `tool_result` is not
+/// in the immediately following message.
+fn push_tool_results(chat: &mut ChatState, turn: &ToolTurn, pending: &str) {
+    for outcome in &turn.outcomes {
+        chat.messages.push(ChatMessage::tool_result(
+            outcome.call_id.clone(),
+            outcome.content.clone(),
+        ));
+    }
+    for call in turn.calls.iter().skip(turn.next) {
+        chat.messages.push(ChatMessage::tool_result(
+            call.id.clone(),
+            pending.to_owned(),
+        ));
+    }
+}
+
+fn settle_tool_turn(chat: &mut ChatState, pending: &str) {
+    if let Some(turn) = chat.turn.take() {
+        push_tool_results(chat, &turn, pending);
+    }
+}
+
+fn permission_rows(request: &PermissionRequest) -> [(&'static str, String); 4] {
+    [
+        ("Herramienta", request.call.name.clone()),
+        ("Ruta", request.key.path.display().to_string()),
+        ("Directorio de la pestaña", String::new()),
+        ("Motivo", request.reason.clone()),
+    ]
 }
 
 #[derive(Clone)]
@@ -115,12 +300,9 @@ pub struct App {
     picker: Option<Picker>,
     branch_tx: std::sync::mpsc::Sender<(String, Vec<BranchInfo>)>,
     branch_rx: std::sync::mpsc::Receiver<(String, Vec<BranchInfo>)>,
-    changes_open: bool,
-    selected_file: Option<(String, bool)>,
-    diff_key: Option<DiffKey>,
-    diff_lines: Option<Vec<String>>,
-    diff_tx: std::sync::mpsc::Sender<(DiffKey, Vec<String>)>,
-    diff_rx: std::sync::mpsc::Receiver<(DiffKey, Vec<String>)>,
+    changes: HashMap<u64, ChangesState>,
+    diff_tx: std::sync::mpsc::Sender<(u64, DiffKey, Vec<String>)>,
+    diff_rx: std::sync::mpsc::Receiver<(u64, DiffKey, Vec<String>)>,
     chat_open: bool,
     chat: ChatState,
     chat_focus: bool,
@@ -134,10 +316,13 @@ pub struct App {
     agent_tab: Option<u64>,
     agent_typed: String,
     agent_output_committed: bool,
+    agent_history: Vec<String>,
+    pending_history_cleanup: Option<(u64, std::time::Instant)>,
     model_rx: Option<Receiver<Result<Vec<String>, String>>>,
     model_list: Option<Vec<String>>,
     model_error: Option<String>,
     models_loading: bool,
+    allowed_tools: HashSet<PermissionKey>,
 }
 
 impl App {
@@ -161,10 +346,7 @@ impl App {
             picker: None,
             branch_tx,
             branch_rx,
-            changes_open: false,
-            selected_file: None,
-            diff_key: None,
-            diff_lines: None,
+            changes: HashMap::new(),
             diff_tx,
             diff_rx,
             chat_open: false,
@@ -180,10 +362,13 @@ impl App {
             agent_tab: None,
             agent_typed: String::new(),
             agent_output_committed: false,
+            agent_history: Vec::new(),
+            pending_history_cleanup: None,
             model_rx: None,
             model_list: None,
             model_error: None,
             models_loading: false,
+            allowed_tools: HashSet::new(),
         })
     }
 
@@ -383,6 +568,9 @@ impl App {
     }
 
     fn close_chat(&mut self, ctx: &egui::Context) {
+        if self.chat.turn.is_some() || self.chat.rx.is_some() {
+            self.cancel_chat(ctx);
+        }
         self.chat_open = false;
         self.chat_focus = false;
         ctx.memory_mut(|m| m.surrender_focus(chat_composer_id()));
@@ -441,6 +629,12 @@ impl App {
         if self.chat.input.trim().is_empty() || self.chat.rx.is_some() {
             return;
         }
+        // A permission dialog can leave a turn pending with no receiver. Settle
+        // it before starting another question so no tool call is left unanswered.
+        settle_tool_turn(
+            &mut self.chat,
+            "El usuario inició otra pregunta; no se ejecutó.",
+        );
         if self.settings.base_url.trim().is_empty() {
             self.chat.error = Some("Configura la Base URL en Ajustes".to_owned());
             return;
@@ -449,11 +643,27 @@ impl App {
             self.chat.error = Some("Configura un modelo en Ajustes".to_owned());
             return;
         }
+        let turn = match new_tool_turn(self.tabs.active(), self.active_cwd().as_deref()) {
+            Ok(turn) => turn,
+            Err(err) => {
+                self.chat.error = Some(err);
+                return;
+            }
+        };
         let input = std::mem::take(&mut self.chat.input);
         self.chat.messages.push(ChatMessage::user(input.trim()));
         self.chat.partial.clear();
         self.chat.error = None;
         self.chat.cancelled = false;
+        self.chat.turn = Some(turn);
+        self.spawn_chat_request(ctx);
+        if focus_composer {
+            self.chat_focus = true;
+        }
+        ctx.request_repaint();
+    }
+
+    fn spawn_chat_request(&mut self, ctx: &egui::Context) {
         let context = self.chat_context();
         let messages = build_messages(&context, &self.chat.messages);
         let client = LlmClient {
@@ -465,14 +675,12 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel();
         self.chat.rx = Some(rx);
         let model = self.settings.model.clone();
+        let tools = tool_definitions();
         std::thread::spawn(move || {
-            if let Err(err) = client.stream(&model, &messages, &tx) {
+            if let Err(err) = client.stream(&model, &messages, &tx, &tools) {
                 let _ = tx.send(StreamUpdate::Error(err));
             }
         });
-        if focus_composer {
-            self.chat_focus = true;
-        }
         ctx.request_repaint();
     }
 
@@ -482,9 +690,11 @@ impl App {
         };
         let mut finished = false;
         let mut disconnected = false;
+        let mut tool_calls: Option<Vec<ToolCall>> = None;
         loop {
             match rx.try_recv() {
                 Ok(StreamUpdate::Delta(delta)) => self.chat.partial.push_str(&delta),
+                Ok(StreamUpdate::ToolCalls(calls)) => tool_calls = Some(calls),
                 Ok(StreamUpdate::Done) => {
                     finished = true;
                     break;
@@ -501,7 +711,42 @@ impl App {
                 }
             }
         }
+        if let Some(calls) = tool_calls {
+            if let Some(turn) = self.chat.turn.as_mut() {
+                turn.calls = calls;
+            }
+        }
         if finished || disconnected {
+            let has_calls = self
+                .chat
+                .turn
+                .as_ref()
+                .is_some_and(|turn| !turn.calls.is_empty());
+            if finished && has_calls {
+                let calls = self
+                    .chat
+                    .turn
+                    .as_ref()
+                    .map(|turn| turn.calls.clone())
+                    .unwrap_or_default();
+                self.chat
+                    .messages
+                    .push(ChatMessage::assistant_tool_calls(calls));
+                self.chat.partial.clear();
+                if disconnected && self.chat.error.is_none() {
+                    self.chat.error = Some("La conexión terminó inesperadamente".to_owned());
+                }
+                if disconnected {
+                    settle_tool_turn(
+                        &mut self.chat,
+                        "La conexión terminó antes de ejecutar esta herramienta.",
+                    );
+                    self.chat.cancelled = false;
+                    return;
+                }
+                self.advance_tools(ctx);
+                return;
+            }
             if !self.chat.partial.is_empty() {
                 let partial = std::mem::take(&mut self.chat.partial);
                 self.chat.messages.push(ChatMessage::assistant(partial));
@@ -510,13 +755,79 @@ impl App {
                 self.chat.error = Some("La conexión terminó inesperadamente".to_owned());
             }
             self.chat.cancelled = false;
+            clear_tool_turn(&mut self.chat);
         } else {
             self.chat.rx = Some(rx);
             ctx.request_repaint();
         }
     }
 
+    fn advance_tools(&mut self, ctx: &egui::Context) {
+        let Some(mut turn) = self.chat.turn.take() else {
+            return;
+        };
+        loop {
+            if turn.next >= turn.calls.len() {
+                break;
+            }
+            match next_tool_action(&turn, &self.allowed_tools) {
+                ToolAction::Execute(call) => {
+                    turn.consume_once(&call);
+                    let outcome = execute(&call, &turn.cwd, std::env::var("HOME").ok().as_deref())
+                        .unwrap_or_else(|err| ToolOutcome {
+                            call_id: call.id.clone(),
+                            content: format!("Error: {err}"),
+                            changed_path: None,
+                        });
+                    turn.outcomes.push(outcome);
+                    turn.next += 1;
+                }
+                ToolAction::Ask(request) => {
+                    turn.permission = Some(request);
+                    self.chat.turn = Some(turn);
+                    ctx.request_repaint();
+                    return;
+                }
+                ToolAction::Finish => break,
+            }
+        }
+        push_tool_results(
+            &mut self.chat,
+            &turn,
+            "El usuario denegó esta operación; no se ejecutó el resto de la ronda.",
+        );
+        if turn.round >= MAX_TOOL_ROUNDS {
+            self.chat.messages.push(ChatMessage::assistant(format!(
+                "Se alcanzó el límite de {MAX_TOOL_ROUNDS} rondas de herramientas."
+            )));
+            return;
+        }
+        turn.round += 1;
+        turn.calls.clear();
+        turn.outcomes.clear();
+        turn.next = 0;
+        turn.permission = None;
+        turn.once_allowed.clear();
+        turn.stopped = false;
+        self.chat.turn = Some(turn);
+        self.spawn_chat_request(ctx);
+    }
+
+    fn resolve_permission(&mut self, decision: PermissionDecision, ctx: &egui::Context) {
+        {
+            let Some(turn) = self.chat.turn.as_mut() else {
+                return;
+            };
+            apply_permission(turn, &mut self.allowed_tools, decision);
+        }
+        self.advance_tools(ctx);
+    }
+
     fn cancel_chat(&mut self, ctx: &egui::Context) {
+        settle_tool_turn(
+            &mut self.chat,
+            "El usuario canceló esta herramienta; no se ejecutó.",
+        );
         let Some(rx) = self.chat.rx.take() else {
             return;
         };
@@ -552,7 +863,11 @@ impl App {
     }
 
     fn submit_inline_question(&mut self, typed: &str, ctx: &egui::Context) {
-        let question = typed.trim().strip_prefix('!').unwrap_or(typed.trim()).trim();
+        let question = typed
+            .trim()
+            .strip_prefix('!')
+            .unwrap_or(typed.trim())
+            .trim();
         if question.is_empty() {
             return;
         }
@@ -565,11 +880,44 @@ impl App {
         self.agent_output_committed = false;
         self.agent_typed = typed.trim().to_owned();
         self.chat.input = question.to_owned();
+        self.record_inline_history(typed.trim(), ctx);
         self.send_chat(ctx, false);
     }
 
+    /// Puts the question in the shell's own history so Up recalls it alongside
+    /// real commands. The helper line is echoed by the PTY, so schedule a
+    /// display-only erase once the shell has consumed it.
+    fn record_inline_history(&mut self, question: &str, ctx: &egui::Context) {
+        let shell = resolve_shell(std::env::var("SHELL").ok().as_deref());
+        let Some(command) = history_add_command(&shell, question) else {
+            return;
+        };
+        let entry = history_entry_text(question);
+        if self.agent_history.last() != Some(&entry) {
+            self.agent_history.push(entry);
+        }
+        let Some(id) = self.tabs.active() else {
+            return;
+        };
+        let Some(tab) = self.tabs.tab_mut(id) else {
+            return;
+        };
+        tab.backend
+            .process_command(BackendCommand::Write(command.into_bytes()));
+        self.pending_history_cleanup = Some((
+            id,
+            std::time::Instant::now() + std::time::Duration::from_millis(150),
+        ));
+        ctx.request_repaint_after(std::time::Duration::from_millis(200));
+    }
+
     fn commit_agent_output(&mut self) {
-        if self.agent_output_committed || self.chat.rx.is_some() || self.agent_typed.is_empty() {
+        if !should_commit_agent_output(
+            self.agent_output_committed,
+            self.chat.rx.is_some(),
+            self.agent_typed.is_empty(),
+            self.chat.turn.is_some(),
+        ) {
             return;
         }
         let answer = if let Some(error) = &self.chat.error {
@@ -593,7 +941,8 @@ impl App {
             output.push_str("\r\n");
         }
         if let Some(tab) = self.agent_tab.and_then(|id| self.tabs.tab_mut(id)) {
-            tab.backend.inject_output_preserving_prompt(output.as_bytes());
+            tab.backend
+                .inject_output_preserving_prompt(output.as_bytes());
         }
         self.agent_output_committed = true;
         self.inline_agent_open = false;
@@ -678,8 +1027,60 @@ impl App {
             .unwrap_or_default()
     }
 
+    fn show_permission(&mut self, ctx: &egui::Context) {
+        let Some(turn) = self.chat.turn.as_ref() else {
+            return;
+        };
+        let Some(request) = turn.permission.clone() else {
+            return;
+        };
+        let cwd = turn.cwd.display().to_string();
+        let mut rows = permission_rows(&request);
+        rows[2].1 = cwd;
+        let mut decision = None;
+
+        let modal = egui::Modal::new(egui::Id::new("repterm-tool-permission")).show(ctx, |ui| {
+            ui.set_width(420.0);
+            ui.strong(format!(
+                "Permiso solicitado: {} (pestaña {}, {} de {})",
+                request.key.tool.as_str(),
+                turn.tab_id,
+                request.index,
+                request.total
+            ));
+            ui.add_space(6.0);
+            for (label, value) in &rows {
+                ui.horizontal(|ui| {
+                    ui.strong(*label);
+                    ui.monospace(value);
+                });
+            }
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("Permitir una vez").clicked() {
+                    decision = Some(PermissionDecision::AllowOnce);
+                }
+                if ui.button("Permitir siempre esta ruta").clicked() {
+                    decision = Some(PermissionDecision::AllowAlways);
+                }
+                if ui.button("Rechazar").clicked() {
+                    decision = Some(PermissionDecision::Deny);
+                }
+            });
+        });
+
+        if modal.backdrop_response.clicked() {
+            decision = Some(PermissionDecision::Deny);
+        }
+        if let Some(decision) = decision {
+            self.resolve_permission(decision, ctx);
+        }
+    }
+
     fn show_chat(&mut self, ctx: &egui::Context) {
         let streaming = self.chat.rx.is_some();
+        let turn_round = self.chat.turn.as_ref().map(|turn| turn.round);
+        let busy = streaming || turn_round.is_some();
         let mut close = false;
         let mut open_settings = false;
         let mut submit = false;
@@ -694,14 +1095,16 @@ impl App {
                 ui.horizontal_centered(|ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
                     ui.strong("AI chat");
-                    let (color, hint) = if self.chat.error.is_some() {
-                        (DEL_COLOR, "error")
+                    let (color, hint): (egui::Color32, String) = if self.chat.error.is_some() {
+                        (DEL_COLOR, "error".to_owned())
+                    } else if let Some(round) = turn_round {
+                        (WARN_COLOR, format!("ronda {round}/8"))
                     } else if streaming {
-                        (WARN_COLOR, "streaming")
+                        (WARN_COLOR, "streaming".to_owned())
                     } else if self.settings.api_key.trim().is_empty() {
-                        (WARN_COLOR, "sin clave configurada")
+                        (WARN_COLOR, "sin clave configurada".to_owned())
                     } else {
-                        (ADD_COLOR, "listo")
+                        (ADD_COLOR, "listo".to_owned())
                     };
                     ui.colored_label(color, format!("● {hint}"));
                     let model = if self.settings.model.trim().is_empty() {
@@ -740,7 +1143,7 @@ impl App {
                     ui.label(error);
                 });
             }
-            if ctx.memory(|m| m.has_focus(composer_id)) && consume_plain_enter(ctx) && !streaming {
+            if ctx.memory(|m| m.has_focus(composer_id)) && consume_plain_enter(ctx) && !busy {
                 submit = true;
             }
             let composer = ui.add(
@@ -756,14 +1159,14 @@ impl App {
                 self.chat_focus = false;
             }
             ui.horizontal(|ui| {
-                let can_send = !self.chat.input.trim().is_empty() && !streaming;
+                let can_send = !self.chat.input.trim().is_empty() && !busy;
                 if ui
                     .add_enabled(can_send, egui::Button::new("Enviar"))
                     .clicked()
                 {
                     submit = true;
                 }
-                if streaming {
+                if busy {
                     if ui.button("Cancelar").clicked() {
                         cancel = true;
                     }
@@ -785,12 +1188,27 @@ impl App {
                 .show(ui, |ui| {
                     ui.add_space(8.0);
                     let max_width = (ui.available_width() * 0.7).max(160.0);
-                    for message in &self.chat.messages {
-                        chat_bubble(ui, message, max_width, &visuals);
-                        if message.role == Role::Assistant {
-                            for block in chat_view::code_blocks(&message.content) {
-                                if ui.small_button("Insertar en terminal").clicked() {
-                                    insert = Some(block);
+                    for (index, message) in self.chat.messages.iter().enumerate() {
+                        if message.role == Role::Tool {
+                            let id = egui::Id::new(("tool-result", index));
+                            let expanded =
+                                ui.memory(|m| m.data.get_temp::<bool>(id).unwrap_or(false));
+                            ui.horizontal(|ui| {
+                                ui.monospace(chat_view::tool_result_summary(&message.content));
+                                if ui.button(if expanded { "Ocultar" } else { "Ver" }).clicked() {
+                                    ui.memory_mut(|m| m.data.insert_temp(id, !expanded));
+                                }
+                            });
+                            if expanded {
+                                ui.monospace(message.content.as_str());
+                            }
+                        } else {
+                            chat_bubble(ui, message, max_width, &visuals);
+                            if message.role == Role::Assistant {
+                                for block in chat_view::code_blocks(&message.content) {
+                                    if ui.small_button("Insertar en terminal").clicked() {
+                                        insert = Some(block);
+                                    }
                                 }
                             }
                         }
@@ -838,12 +1256,19 @@ impl App {
         }
         if open_settings {
             self.open_settings(ctx);
-        } else if self.chat_open && !had_insert && !close && !ctx.memory(|m| m.has_focus(composer_id)) {
+        } else if self.chat_open
+            && !had_insert
+            && !close
+            && !ctx.memory(|m| m.has_focus(composer_id))
+        {
             self.chat_focus = true;
         }
     }
 
     fn poll_repo(&mut self, ctx: &egui::Context) {
+        let ids = self.tabs.ids();
+        self.changes.retain(|id, _| ids.contains(id));
+
         while let Ok((path, list)) = self.branch_rx.try_recv() {
             if let Some(picker) = self.picker.as_mut() {
                 if self.repo_path.as_deref() == Some(path.as_str()) {
@@ -851,9 +1276,11 @@ impl App {
                 }
             }
         }
-        while let Ok((key, lines)) = self.diff_rx.try_recv() {
-            if self.diff_key.as_ref() == Some(&key) {
-                self.diff_lines = Some(lines);
+        while let Ok((id, key, lines)) = self.diff_rx.try_recv() {
+            if let Some(state) = self.changes.get_mut(&id) {
+                if state.diff_key.as_ref() == Some(&key) {
+                    state.diff_lines = Some(lines);
+                }
             }
         }
         while let Ok((path, status)) = self.probe_rx.try_recv() {
@@ -997,6 +1424,10 @@ impl App {
     }
 
     fn show_changes(&mut self, ctx: &egui::Context) {
+        let Some(id) = self.tabs.active() else {
+            return;
+        };
+        let state = self.changes.entry(id).or_default();
         let files: Vec<ChangedFile> = self
             .repo
             .as_ref()
@@ -1005,19 +1436,19 @@ impl App {
         let (count, added, removed) = change_totals(&files);
         let valid =
             |sel: &(String, bool)| files.iter().any(|f| f.path == sel.0 && f.staged == sel.1);
-        if !self.selected_file.as_ref().is_some_and(valid) {
-            self.selected_file = files.first().map(|f| (f.path.clone(), f.staged));
+        if !state.selected_file.as_ref().is_some_and(valid) {
+            state.selected_file = files.first().map(|f| (f.path.clone(), f.staged));
         }
-        let selected = self
+        let selected = state
             .selected_file
             .as_ref()
             .and_then(|(p, s)| files.iter().find(|f| &f.path == p && f.staged == *s));
         let wanted = selected
             .zip(self.repo_path.as_ref())
             .map(|(f, repo)| (repo.clone(), f.path.clone(), f.staged, f.added, f.removed));
-        if wanted != self.diff_key {
-            self.diff_key = wanted.clone();
-            self.diff_lines = None;
+        if wanted != state.diff_key {
+            state.diff_key = wanted.clone();
+            state.diff_lines = None;
             if let (Some(key), Some(file)) = (wanted, selected.cloned()) {
                 let tx = self.diff_tx.clone();
                 let ctx = ctx.clone();
@@ -1028,7 +1459,7 @@ impl App {
                         .take(MAX_DIFF_LINES)
                         .map(str::to_owned)
                         .collect();
-                    let _ = tx.send((key, lines));
+                    let _ = tx.send((id, key, lines));
                     ctx.request_repaint();
                 });
             }
@@ -1073,7 +1504,7 @@ impl App {
                             }
                             ui.weak(if staged { "Staged" } else { "Unstaged" });
                             for f in group {
-                                let is_sel = self.selected_file.as_ref()
+                                let is_sel = state.selected_file.as_ref()
                                     == Some(&(f.path.clone(), f.staged));
                                 if ui.selectable_label(is_sel, file_row(f)).clicked() {
                                     pick = Some((f.path.clone(), f.staged));
@@ -1082,7 +1513,7 @@ impl App {
                         }
                     });
                 ui.separator();
-                match (&self.diff_lines, selected) {
+                match (&state.diff_lines, selected) {
                     (None, _) => {
                         ui.weak("Loading diff…");
                     }
@@ -1118,10 +1549,10 @@ impl App {
                 }
             });
         if pick.is_some() {
-            self.selected_file = pick;
+            state.selected_file = pick;
         }
         if close {
-            self.changes_open = false;
+            state.open = false;
         }
     }
 
@@ -1597,11 +2028,23 @@ impl eframe::App for App {
         self.poll_chat(ctx);
         self.commit_agent_output();
 
+        if let Some((id, at)) = self.pending_history_cleanup {
+            if std::time::Instant::now() >= at {
+                self.pending_history_cleanup = None;
+                if let Some(tab) = self.tabs.tab_mut(id) {
+                    tab.backend.inject_output(b"\x1b[1A\x1b[2K\x1b[1B");
+                }
+            }
+        }
+
+        let permission_pending = permission_pending(self.chat.turn.as_ref());
+
         let mut exit_agent = false;
         if (self.inline_agent_open || self.agent_conversation)
             && agent_tab_is_active(self.tabs.active(), self.agent_tab)
             && !self.chat_open
             && !self.settings_open
+            && !permission_pending
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
         {
             exit_agent = true;
@@ -1615,7 +2058,11 @@ impl eframe::App for App {
             ctx.request_repaint();
         }
 
-        if !self.settings_open {
+        if permission_pending {
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+                self.resolve_permission(PermissionDecision::Deny, ctx);
+            }
+        } else if !self.settings_open {
             if ctx.input_mut(|i| {
                 i.consume_key(
                     egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
@@ -1687,10 +2134,17 @@ impl eframe::App for App {
                 self.open_picker(ctx);
             }
             if changes {
-                self.changes_open = !self.changes_open;
+                if let Some(id) = self.tabs.active() {
+                    let state = self.changes.entry(id).or_default();
+                    state.open = !state.open;
+                }
             }
         }
-        if self.changes_open {
+        if self
+            .tabs
+            .active()
+            .is_some_and(|id| self.changes.get(&id).is_some_and(|state| state.open))
+        {
             self.show_changes(ctx);
         }
         self.show_picker(ctx);
@@ -1700,6 +2154,7 @@ impl eframe::App for App {
             return;
         }
 
+        self.show_permission(ctx);
         if self.chat_open {
             self.show_chat(ctx);
         } else {
@@ -1716,11 +2171,15 @@ impl eframe::App for App {
                     let size = ui.available_size();
                     let terminal = TerminalView::new(ui, &mut tab.backend)
                         .set_focus(
-                            !self.chat_open && !self.settings_open && self.picker.is_none(),
+                            !self.chat_open
+                                && !self.settings_open
+                                && self.picker.is_none()
+                                && !permission_pending,
                         )
                         .set_size(size)
                         .set_bang_submit(&mut inline_question)
                         .set_bang_draft(&mut bang_draft)
+                        .set_agent_history(&self.agent_history)
                         .set_inline_lines(&inline_lines)
                         .set_agent_conversation(agent_tab_active && self.agent_conversation)
                         .set_release_overlay(agent_tab_active && self.agent_output_committed)
@@ -1745,20 +2204,85 @@ fn agent_tab_is_active(active: Option<u64>, agent_tab: Option<u64>) -> bool {
     active.is_some() && active == agent_tab
 }
 
+/// A tool turn with a pending permission has no answer yet. Writing the inline
+/// answer at that point would echo the question and strand the permission
+/// request with no UI able to resolve it.
+fn should_commit_agent_output(
+    committed: bool,
+    streaming: bool,
+    typed_empty: bool,
+    turn_pending: bool,
+) -> bool {
+    !committed && !streaming && !typed_empty && !turn_pending
+}
+
+fn permission_pending(turn: Option<&ToolTurn>) -> bool {
+    turn.is_some_and(|turn| turn.permission.is_some())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_tab_is_active, bang_command, build_context, classify_diff_line, clip_title, command_target,
-        ctrl_backspace_bindings, files_noun, is_bare_bang, matches_query, tab_label, DiffLine,
-        SettingsForm,
+        agent_tab_is_active, apply_permission, bang_command, build_context, classify_diff_line,
+        clear_tool_turn, clip_title, command_target, ctrl_backspace_bindings, files_noun,
+        is_bare_bang, matches_query, new_tool_turn, next_tool_action, permission_pending,
+        permission_rows, push_tool_results, should_commit_agent_output, tab_label, ChatState,
+        DiffLine, PermissionDecision, PermissionKey, PermissionRequest, SettingsForm, ToolAction,
+        ToolName, ToolTurn,
     };
+    use crate::llm::{ChatMessage, Role};
+    use crate::tools::{ToolCall, ToolOutcome};
     use egui_term::{BindingAction, InputKind};
+    use std::collections::HashSet;
+
+    use std::path::PathBuf;
 
     #[test]
     fn agent_mode_is_only_active_on_its_originating_tab() {
         assert!(agent_tab_is_active(Some(1), Some(1)));
         assert!(!agent_tab_is_active(Some(2), Some(1)));
         assert!(!agent_tab_is_active(None, None));
+    }
+
+    #[test]
+    fn pending_tool_turn_blocks_inline_commit() {
+        assert!(should_commit_agent_output(false, false, false, false));
+        assert!(!should_commit_agent_output(false, false, false, true));
+        assert!(!should_commit_agent_output(true, false, false, false));
+        assert!(!should_commit_agent_output(false, true, false, false));
+        assert!(!should_commit_agent_output(false, false, true, false));
+    }
+
+    #[test]
+    fn permission_pending_only_matches_a_turn_waiting_for_a_decision() {
+        let mut turn = ToolTurn {
+            tab_id: 1,
+            cwd: PathBuf::from("/tmp"),
+            round: 1,
+            calls: Vec::new(),
+            outcomes: Vec::new(),
+            next: 0,
+            permission: None,
+            once_allowed: HashSet::new(),
+            stopped: false,
+        };
+        assert!(!permission_pending(Some(&turn)));
+        turn.permission = Some(PermissionRequest {
+            call: ToolCall {
+                id: "c1".into(),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            },
+            key: PermissionKey {
+                tool: ToolName::ReadFile,
+                path: PathBuf::from("/etc/hosts"),
+            },
+            reason: "diagnóstico".into(),
+            index: 1,
+            total: 1,
+        });
+        assert!(permission_pending(Some(&turn)));
+        assert!(!permission_pending(None));
     }
 
     #[test]
@@ -1865,6 +2389,29 @@ mod tests {
     }
 
     #[test]
+    fn permission_rows_show_tool_path_cwd_and_reason() {
+        let req = PermissionRequest {
+            call: ToolCall {
+                id: "c1".into(),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            },
+            key: PermissionKey {
+                tool: ToolName::ReadFile,
+                path: PathBuf::from("/etc/hosts"),
+            },
+            reason: "diagnóstico".into(),
+            index: 1,
+            total: 2,
+        };
+        let rows = permission_rows(&req);
+        assert_eq!(rows[0].0, "Herramienta");
+        assert_eq!(rows[0].1, "read_file");
+        assert_eq!(rows[1].1, "/etc/hosts");
+        assert_eq!(rows[3].1, "diagnóstico");
+    }
+
+    #[test]
     fn context_respects_privacy_switch() {
         let lines = vec!["SECRETO_LINEA".to_owned()];
         let full = build_context(None, Some("/repo"), Some("SECRETO_SELECCION"), &lines, true);
@@ -1878,5 +2425,274 @@ mod tests {
         assert!(full.contains("SECRETO_LINEA") && full.contains("SECRETO_SELECCION"));
         assert!(redacted.contains("/repo"));
         assert!(!redacted.contains("SECRETO_LINEA") && !redacted.contains("SECRETO_SELECCION"));
+    }
+
+    #[test]
+    fn new_tool_turn_requires_active_cwd() {
+        assert!(new_tool_turn(None, None).is_err());
+        assert!(new_tool_turn(Some(1), None).is_err());
+    }
+
+    #[test]
+    fn new_tool_turn_snapshots_tab_and_cwd() {
+        let root = std::env::temp_dir().join(format!("repterm-turn-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let turn = new_tool_turn(Some(7), root.to_str()).unwrap();
+        assert_eq!(turn.tab_id, 7);
+        assert_eq!(turn.cwd, std::fs::canonicalize(&root).unwrap());
+        assert_eq!(turn.round, 1);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn next_tool_action_asks_outside_and_executes_allowed() {
+        let root = std::env::temp_dir().join(format!("repterm-policy-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let cwd = std::fs::canonicalize(&root).unwrap();
+        let turn = ToolTurn {
+            tab_id: 1,
+            cwd: cwd.clone(),
+            round: 1,
+            calls: vec![ToolCall {
+                id: "c1".into(),
+                name: "read_file".into(),
+                arguments: r#"{"path":"/etc/hosts","reason":"diagnóstico"}"#.into(),
+            }],
+            outcomes: vec![],
+            next: 0,
+            permission: None,
+            once_allowed: HashSet::new(),
+            stopped: false,
+        };
+        let mut allowed = HashSet::new();
+        assert!(matches!(
+            next_tool_action(&turn, &allowed),
+            ToolAction::Ask(_)
+        ));
+        let tool = ToolName::from_str("read_file").unwrap();
+        allowed.insert(PermissionKey {
+            tool,
+            path: PathBuf::from("/etc/hosts"),
+        });
+        assert!(matches!(
+            next_tool_action(&turn, &allowed),
+            ToolAction::Execute(_)
+        ));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn allow_once_executes_without_joining_the_session_list() {
+        let root = std::env::temp_dir().join(format!("repterm-once-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let cwd = std::fs::canonicalize(&root).unwrap();
+        let call = ToolCall {
+            id: "c1".into(),
+            name: "read_file".into(),
+            arguments: r#"{"path":"/etc/hosts","reason":"diagnóstico"}"#.into(),
+        };
+        let mut turn = ToolTurn {
+            tab_id: 1,
+            cwd,
+            round: 1,
+            calls: vec![call.clone(), call.clone()],
+            outcomes: vec![],
+            next: 0,
+            permission: Some(PermissionRequest {
+                call: call.clone(),
+                key: PermissionKey {
+                    tool: ToolName::ReadFile,
+                    path: PathBuf::from("/etc/hosts"),
+                },
+                reason: "diagnóstico".into(),
+                index: 1,
+                total: 2,
+            }),
+            once_allowed: HashSet::new(),
+            stopped: false,
+        };
+        let mut allowed = HashSet::new();
+        apply_permission(&mut turn, &mut allowed, PermissionDecision::AllowOnce);
+        assert!(allowed.is_empty());
+        assert!(matches!(
+            next_tool_action(&turn, &allowed),
+            ToolAction::Execute(_)
+        ));
+        turn.consume_once(&call);
+        assert!(matches!(
+            next_tool_action(&turn, &allowed),
+            ToolAction::Ask(_)
+        ));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn denial_stops_remaining_calls() {
+        let root = std::env::temp_dir().join(format!("repterm-deny-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let cwd = std::fs::canonicalize(&root).unwrap();
+        let call = |id: &str| ToolCall {
+            id: id.into(),
+            name: "read_file".into(),
+            arguments: r#"{"path":"/etc/hosts","reason":" diagnóstico"}"#.into(),
+        };
+        let mut turn = ToolTurn {
+            tab_id: 1,
+            cwd,
+            round: 1,
+            calls: vec![call("a"), call("b"), call("c")],
+            outcomes: vec![],
+            next: 0,
+            permission: Some(PermissionRequest {
+                call: call("a"),
+                key: PermissionKey {
+                    tool: ToolName::ReadFile,
+                    path: PathBuf::from("/etc/hosts"),
+                },
+                reason: "diagnóstico".into(),
+                index: 1,
+                total: 3,
+            }),
+            once_allowed: HashSet::new(),
+            stopped: false,
+        };
+        let mut allowed = HashSet::new();
+        apply_permission(&mut turn, &mut allowed, PermissionDecision::Deny);
+        turn.stopped = true;
+        assert!(turn.permission.is_none());
+        assert!(allowed.is_empty());
+        assert!(matches!(
+            next_tool_action(&turn, &allowed),
+            ToolAction::Finish
+        ));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn cancel_turn_clears_permission() {
+        let mut chat = ChatState::new();
+        let root = std::env::temp_dir().join(format!("repterm-cancel-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let cwd = std::fs::canonicalize(&root).unwrap();
+        chat.turn = Some(ToolTurn {
+            tab_id: 1,
+            cwd,
+            round: 1,
+            calls: vec![],
+            outcomes: vec![],
+            next: 0,
+            permission: Some(PermissionRequest {
+                call: ToolCall {
+                    id: "x".into(),
+                    name: "read_file".into(),
+                    arguments: "{}".into(),
+                },
+                key: PermissionKey {
+                    tool: ToolName::ReadFile,
+                    path: PathBuf::from("/etc/hosts"),
+                },
+                reason: "r".into(),
+                index: 1,
+                total: 1,
+            }),
+            once_allowed: HashSet::new(),
+            stopped: false,
+        });
+        clear_tool_turn(&mut chat);
+        assert!(chat.turn.is_none());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    fn sample_turn() -> (ToolTurn, Vec<ToolCall>) {
+        let calls = (1..=3)
+            .map(|n| ToolCall {
+                id: format!("c{n}"),
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            })
+            .collect::<Vec<_>>();
+        let turn = ToolTurn {
+            tab_id: 1,
+            cwd: PathBuf::from("/tmp"),
+            round: 1,
+            calls: calls.clone(),
+            outcomes: vec![ToolOutcome {
+                call_id: "c1".into(),
+                content: "contenido".into(),
+                changed_path: None,
+            }],
+            next: 1,
+            permission: None,
+            once_allowed: HashSet::new(),
+            stopped: true,
+        };
+        (turn, calls)
+    }
+
+    #[test]
+    fn settling_turn_answers_announced_calls() {
+        let (turn, calls) = sample_turn();
+        let mut chat = ChatState::new();
+        chat.messages.push(ChatMessage::assistant_tool_calls(calls));
+        chat.turn = Some(turn);
+        super::settle_tool_turn(&mut chat, "cancelado");
+        assert!(chat.turn.is_none());
+        assert_eq!(
+            chat.messages
+                .iter()
+                .filter(|message| message.role == Role::Tool)
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn tool_results_are_contiguous_with_no_assistant_notes() {
+        let (turn, calls) = sample_turn();
+        let mut chat = ChatState::new();
+        chat.messages.push(ChatMessage::assistant_tool_calls(calls));
+        push_tool_results(&mut chat, &turn, "denegado");
+        let roles = chat
+            .messages
+            .iter()
+            .map(|message| message.role)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            roles,
+            vec![Role::Assistant, Role::Tool, Role::Tool, Role::Tool]
+        );
+    }
+
+    #[test]
+    fn denial_answers_every_remaining_call() {
+        let (turn, _) = sample_turn();
+        let mut chat = ChatState::new();
+        push_tool_results(&mut chat, &turn, "denegado");
+        let ids = chat
+            .messages
+            .iter()
+            .filter(|message| message.role == Role::Tool)
+            .map(|message| message.tool_call_id.clone().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["c1", "c2", "c3"]);
+        assert!(chat
+            .messages
+            .iter()
+            .all(|message| message.role == Role::Tool));
+    }
+
+    #[test]
+    fn build_messages_keeps_contiguous_results_as_one_unit() {
+        let (turn, calls) = sample_turn();
+        let mut chat = ChatState::new();
+        chat.messages.push(ChatMessage::assistant_tool_calls(calls));
+        push_tool_results(&mut chat, &turn, "denegado");
+        chat.messages
+            .push(ChatMessage::assistant("texto posterior"));
+        let built = crate::llm::build_messages("ctx", &chat.messages);
+        assert_eq!(built[1].role, Role::Assistant);
+        assert!(built[1].tool_calls.is_some());
+        assert!(built[2..5].iter().all(|message| message.role == Role::Tool));
+        assert_eq!(built[5].role, Role::Assistant);
     }
 }

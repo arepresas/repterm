@@ -64,6 +64,7 @@ pub struct TerminalView<'a> {
     bindings_layout: BindingsLayout,
     bang_submit: Option<&'a mut Option<String>>,
     bang_draft: Option<&'a mut Option<String>>,
+    agent_history: Option<&'a [String]>,
     inline_lines: Option<&'a [String]>,
     agent_conversation: bool,
     release_overlay: bool,
@@ -109,6 +110,7 @@ impl<'a> TerminalView<'a> {
             bindings_layout: BindingsLayout::new(),
             bang_submit: None,
             bang_draft: None,
+            agent_history: None,
             inline_lines: None,
             agent_conversation: false,
             release_overlay: false,
@@ -125,6 +127,14 @@ impl<'a> TerminalView<'a> {
     #[inline]
     pub fn set_bang_draft(mut self, target: &'a mut Option<String>) -> Self {
         self.bang_draft = Some(target);
+        self
+    }
+
+    /// Entries repterm added to the shell history. Used to tell a recalled
+    /// `!question` apart from an ordinary shell command containing `!`.
+    #[inline]
+    pub fn set_agent_history(mut self, entries: &'a [String]) -> Self {
+        self.agent_history = Some(entries);
         self
     }
 
@@ -223,12 +233,30 @@ impl<'a> TerminalView<'a> {
             state.bang_cursor = 0;
         }
 
+        let recalled_bang = match self.agent_history {
+            Some(entries) => recalled_agent_line(self.backend.sync(), entries),
+            None => None,
+        };
+
         let modifiers = layout.ctx.input(|i| i.modifiers);
         let events = layout.ctx.input(|i| i.events.clone());
         for event in events {
-            match track_bang_submit(&event, state, self.agent_conversation) {
+            match track_bang_submit(
+                &event,
+                state,
+                self.agent_conversation,
+                recalled_bang.as_deref(),
+            ) {
                 BangAction::Consume => continue,
                 BangAction::Submit(question) => {
+                    if let Some(target) = self.bang_submit.as_deref_mut() {
+                        *target = Some(question);
+                    }
+                    continue;
+                }
+                BangAction::SubmitRecalled(question) => {
+                    self.backend
+                        .process_command(BackendCommand::Write(vec![0x15]));
                     if let Some(target) = self.bang_submit.as_deref_mut() {
                         *target = Some(question);
                     }
@@ -757,6 +785,42 @@ fn word_right(text: &str, cursor: usize) -> usize {
     index
 }
 
+fn current_input_line(content: &crate::backend::RenderableContent) -> String {
+    let cursor = content.grid.cursor.point;
+    content
+        .grid
+        .display_iter()
+        .filter(|indexed| {
+            indexed.point.line == cursor.line
+                && indexed.point.column.0 <= cursor.column.0
+                && !indexed
+                    .cell
+                    .flags
+                    .intersects(cell::Flags::WIDE_CHAR_SPACER)
+        })
+        .map(|indexed| indexed.c)
+        .collect()
+}
+
+fn recalled_agent_line(
+    content: &crate::backend::RenderableContent,
+    entries: &[String],
+) -> Option<String> {
+    let line = current_input_line(content);
+    if let Some(entry) = entries
+        .iter()
+        .rev()
+        .find(|entry| entry.starts_with('!') && line.ends_with(entry.as_str()))
+    {
+        return Some(entry.clone());
+    }
+    // Entries from earlier repterm sessions are not in `entries`, but still
+    // carry the `!` prefix in the shell history.
+    let start = line.find('!')?;
+    let text = line[start..].trim_end().to_owned();
+    (text.len() > 1).then_some(text)
+}
+
 fn is_bang_submit(event: &egui::Event) -> bool {
     match event {
         egui::Event::Key {
@@ -800,12 +864,14 @@ enum BangAction {
     PassThrough,
     Consume,
     Submit(String),
+    SubmitRecalled(String),
 }
 
 fn track_bang_submit(
     event: &egui::Event,
     state: &mut TerminalViewState,
     agent_conversation: bool,
+    recalled_bang: Option<&str>,
 ) -> BangAction {
     if state.bang_draft.is_none()
         && state.bang_committed.is_some()
@@ -823,6 +889,16 @@ fn track_bang_submit(
         state.bang_committed = None;
         if matches!(event, egui::Event::Key { key: Key::Escape, .. }) {
             return BangAction::Consume;
+        }
+    }
+
+    if state.bang_draft.is_none() {
+        if let Some(question) = recalled_bang {
+            if is_bang_submit(event) {
+                state.bang_committed = Some(question.to_owned());
+                state.line_input = Some(String::new());
+                return BangAction::SubmitRecalled(question.to_owned());
+            }
         }
     }
 
