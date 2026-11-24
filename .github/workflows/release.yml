@@ -110,4 +110,4 @@ jobs:
       - name: Upload release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${{ needs.release-please.outputs.tag_name }}" dist/* --clobber
+        run: gh release upload "${{ needs.release-please.outputs.tag_name }}" dist/* --clobber --repo "${{ github.repository }}"
