@@ -1,5 +1,8 @@
 # repterm
 
+[![ci](https://github.com/arepresas/repterm/actions/workflows/ci.yml/badge.svg)](https://github.com/arepresas/repterm/actions/workflows/ci.yml)
+[![release](https://github.com/arepresas/repterm/actions/workflows/release.yml/badge.svg)](https://github.com/arepresas/repterm/actions/workflows/release.yml)
+
 A fast, simple terminal emulator built with Rust, egui, and egui_term.
 
 ## Features
@@ -104,6 +107,16 @@ login shell) so new tabs pick it up. A few things to keep in mind:
 ## Tests
 
 ```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
 cargo test
-cargo clippy --all-targets
+cargo build
 ```
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## License
+
+MIT. See [LICENSE](LICENSE).
