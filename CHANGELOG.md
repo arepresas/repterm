@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented here.
 
+## [0.1.3](https://github.com/arepresas/repterm/compare/v0.1.2...v0.1.3) (2026-11-24)
+
+
+### Bug Fixes
+
+* **shell:** set TERM for GUI launches ([4bfbe64](https://github.com/arepresas/repterm/commit/4bfbe64853d337cf9a5fd5f4c88c882ae45ec6f3))
+
 ## [0.1.2](https://github.com/arepresas/repterm/compare/v0.1.1...v0.1.2) (2026-11-24)
 
 
