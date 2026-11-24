@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented here.
 
+## [0.1.5](https://github.com/arepresas/repterm/compare/v0.1.4...v0.1.5) (2026-11-24)
+
+
+### Bug Fixes
+
+* require and launch zsh in the Debian package ([#25](https://github.com/arepresas/repterm/issues/25)) ([63639d9](https://github.com/arepresas/repterm/commit/63639d94d6b9af6d102f267634e2d8f1558661e6))
+
 ## [0.1.4](https://github.com/arepresas/repterm/compare/v0.1.3...v0.1.4) (2026-11-24)
 
 
