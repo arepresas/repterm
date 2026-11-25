@@ -82,7 +82,7 @@ Download the `.deb` for `amd64` from the [latest release](https://github.com/are
 sudo apt install ./repterm_*_amd64.deb
 ```
 
-The package installs `/usr/bin/repterm`, depends on `zsh`, and always starts new tabs in zsh. If zsh is missing it exits with an explanation instead of starting. The `.tar.gz` archives are still published alongside it for other distributions and architectures.
+The package installs `/usr/bin/repterm`, a desktop entry, and an application icon, so repterm appears in the Ubuntu application grid. It depends on `zsh` and always starts new tabs in zsh. If zsh is missing it exits with an explanation instead of starting. The `.tar.gz` archives are still published alongside it for other distributions and architectures.
 
 ## Build and run
 

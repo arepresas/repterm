@@ -23,6 +23,9 @@ fn main() -> eframe::Result {
             .with_min_inner_size([320.0, 240.0]),
         ..Default::default()
     };
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/repterm.png"))
+        .map_err(|err| eframe::Error::AppCreation(Box::new(err)))?;
+    options.viewport = options.viewport.with_icon(icon);
     // Release builds pick Vulkan first. On AMD Vega that corrupts text and
     // drops repaints. GL matches `WGPU_BACKEND=gl`, which renders correctly.
     #[cfg(target_os = "linux")]
