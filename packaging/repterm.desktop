@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=repterm
+GenericName=Terminal Emulator
+Comment=Terminal emulator with an AI chat agent
+Exec=/usr/bin/repterm
+TryExec=/usr/bin/repterm
+Icon=repterm
+Terminal=false
+Categories=System;TerminalEmulator;
+StartupNotify=true
+StartupWMClass=repterm
+Keywords=terminal;shell;ai;git;

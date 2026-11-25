@@ -66,7 +66,9 @@ jobs:
           root="${RUNNER_TEMP}/repterm-deb"
           mkdir -p dist
           rm -rf "$root"
-          mkdir -p "$root/DEBIAN" "$root/usr/bin" "$root/usr/lib/repterm" "$root/usr/share/doc/repterm"
+          mkdir -p "$root/DEBIAN" "$root/usr/bin" "$root/usr/lib/repterm" "$root/usr/share/doc/repterm" \
+            "$root/usr/share/applications" "$root/usr/share/icons/hicolor/scalable/apps" \
+            "$root/usr/share/icons/hicolor/256x256/apps" "$root/usr/share/pixmaps"
           cp "target/${{ matrix.target }}/release/repterm" "$root/usr/lib/repterm/repterm"
           chmod 755 "$root/usr/lib/repterm/repterm"
           cat > "$root/usr/bin/repterm" <<'LAUNCHER'
@@ -81,6 +83,12 @@ jobs:
           exec /usr/lib/repterm/repterm "$@"
           LAUNCHER
           chmod 755 "$root/usr/bin/repterm"
+          cp packaging/repterm.desktop "$root/usr/share/applications/repterm.desktop"
+          cp assets/repterm.svg "$root/usr/share/icons/hicolor/scalable/apps/repterm.svg"
+          cp assets/repterm.png "$root/usr/share/icons/hicolor/256x256/apps/repterm.png"
+          cp assets/repterm.png "$root/usr/share/pixmaps/repterm.png"
+          cp packaging/postinst packaging/postrm "$root/DEBIAN/"
+          chmod 755 "$root/DEBIAN/postinst" "$root/DEBIAN/postrm"
           cp README.md LICENSE "$root/usr/share/doc/repterm/"
           cat > "$root/DEBIAN/control" <<EOF
           Package: repterm
@@ -90,7 +98,7 @@ jobs:
           Architecture: amd64
           Maintainer: repterm maintainers <noreply@github.com>
           Homepage: https://github.com/${{ github.repository }}
-          Depends: libc6, libgcc-s1, zsh
+          Depends: libc6, libgcc-s1, zsh, hicolor-icon-theme, desktop-file-utils, gtk-update-icon-cache
           Description: Fast terminal emulator with an AI chat agent
            repterm is built with Rust, egui and egui_term, with git status,
            a branch and diff picker, and a LiteLLM-backed AI chat agent.
