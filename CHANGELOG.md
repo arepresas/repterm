@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented here.
 
+## [0.3.1](https://github.com/arepresas/repterm/compare/v0.3.0...v0.3.1) (2026-11-25)
+
+
+### Bug Fixes
+
+* **app:** support ctrl+v and ctrl+shift+v paste ([ad57dad](https://github.com/arepresas/repterm/commit/ad57dadf6e9283ed3eca564795e99ad353c4fc98))
+
 ## [0.3.0](https://github.com/arepresas/repterm/compare/v0.2.0...v0.3.0) (2026-11-25)
 
 
