@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented here.
 
+## [0.3.0](https://github.com/arepresas/repterm/compare/v0.2.0...v0.3.0) (2026-11-25)
+
+
+### Features
+
+* **ci:** add desktop entry and icon to deb ([aece862](https://github.com/arepresas/repterm/commit/aece862f181d1cf64f03d3036a219200e4199cc3))
+
 ## [0.2.0](https://github.com/arepresas/repterm/compare/v0.1.5...v0.2.0) (2026-11-24)
 
 
