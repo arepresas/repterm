@@ -1790,6 +1790,67 @@ fn consume_plain_enter(ctx: &egui::Context) -> bool {
     consumed
 }
 
+fn terminal_paste_events(
+    events: Vec<egui::Event>,
+    terminal_focused: bool,
+    clipboard_text: Option<String>,
+) -> Vec<egui::Event> {
+    if !terminal_focused {
+        return events;
+    }
+
+    let has_paste_event = events
+        .iter()
+        .any(|event| matches!(event, egui::Event::Paste(_)));
+    let mut clipboard_used = false;
+    let mut normalized = Vec::with_capacity(events.len());
+
+    for event in events {
+        if is_plain_ctrl_v(&event) {
+            continue;
+        }
+        if is_ctrl_shift_v(&event) {
+            if !has_paste_event && !clipboard_used {
+                if let Some(text) = &clipboard_text {
+                    normalized.push(egui::Event::Text(text.clone()));
+                    clipboard_used = true;
+                }
+            }
+            continue;
+        }
+        normalized.push(match event {
+            egui::Event::Paste(text) => egui::Event::Text(text),
+            other => other,
+        });
+    }
+
+    normalized
+}
+
+fn is_plain_ctrl_v(event: &egui::Event) -> bool {
+    matches!(
+        event,
+        egui::Event::Key {
+            key: egui::Key::V,
+            pressed: true,
+            modifiers,
+            ..
+        } if modifiers.ctrl && !modifiers.alt && !modifiers.mac_cmd && !modifiers.shift
+    )
+}
+
+fn is_ctrl_shift_v(event: &egui::Event) -> bool {
+    matches!(
+        event,
+        egui::Event::Key {
+            key: egui::Key::V,
+            pressed: true,
+            modifiers,
+            ..
+        } if modifiers.ctrl && modifiers.shift && !modifiers.alt && !modifiers.mac_cmd
+    )
+}
+
 fn user_layout(text: &str) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::default();
     job.append(
@@ -2059,6 +2120,38 @@ impl eframe::App for App {
 
         let permission_pending = permission_pending(self.chat.turn.as_ref());
 
+        let terminal_focused = !self.chat_open
+            && !self.settings_open
+            && self.picker.is_none()
+            && !permission_pending
+            && self.tabs.active().is_some();
+        let needs_clipboard = terminal_focused
+            && ctx.input(|input| {
+                input.events.iter().any(is_ctrl_shift_v)
+                    && !input
+                        .events
+                        .iter()
+                        .any(|event| matches!(event, egui::Event::Paste(_)))
+            });
+        let clipboard_text = if needs_clipboard {
+            match read_clipboard() {
+                Ok(text) => Some(text),
+                Err(err) => {
+                    log::warn!("clipboard read failed: {err}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        ctx.input_mut(|input| {
+            input.events = terminal_paste_events(
+                std::mem::take(&mut input.events),
+                terminal_focused,
+                clipboard_text,
+            );
+        });
+
         let mut exit_agent = false;
         if (self.inline_agent_open || self.agent_conversation)
             && agent_tab_is_active(self.tabs.active(), self.agent_tab)
@@ -2250,9 +2343,9 @@ mod tests {
         agent_tab_is_active, apply_permission, bang_command, build_context, classify_diff_line,
         clear_tool_turn, clip_title, command_target, ctrl_backspace_bindings, files_noun,
         is_bare_bang, matches_query, new_tool_turn, next_tool_action, permission_pending,
-        permission_rows, push_tool_results, should_commit_agent_output, tab_label, ChatState,
-        DiffLine, PermissionDecision, PermissionKey, PermissionRequest, SettingsForm, ToolAction,
-        ToolName, ToolTurn,
+        permission_rows, push_tool_results, should_commit_agent_output, tab_label,
+        terminal_paste_events, ChatState, DiffLine, PermissionDecision, PermissionKey,
+        PermissionRequest, SettingsForm, ToolAction, ToolName, ToolTurn,
     };
     use crate::llm::{ChatMessage, Role};
     use crate::tools::{ToolCall, ToolOutcome};
@@ -2317,6 +2410,101 @@ mod tests {
     #[test]
     fn clip_title_keeps_path_tail() {
         assert_eq!(clip_title("abcdefghijklmnopqrstuvwxyz", 4), "…xyz");
+    }
+
+    fn ctrl_v_event() -> egui::Event {
+        egui::Event::Key {
+            key: egui::Key::V,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                ctrl: true,
+                command: true,
+                ..Default::default()
+            },
+        }
+    }
+
+    fn ctrl_shift_v_event() -> egui::Event {
+        egui::Event::Key {
+            key: egui::Key::V,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                ctrl: true,
+                shift: true,
+                command: true,
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn terminal_paste_becomes_text_and_drops_ctrl_v() {
+        let events = vec![
+            egui::Event::Paste("ls -la".to_owned()),
+            ctrl_v_event(),
+            egui::Event::PointerMoved(egui::Pos2::ZERO),
+        ];
+
+        let events = terminal_paste_events(events, true, None);
+
+        assert_eq!(events.len(), 2);
+        assert!(matches!(&events[0], egui::Event::Text(text) if text == "ls -la"));
+        assert!(matches!(&events[1], egui::Event::PointerMoved(_)));
+    }
+
+    #[test]
+    fn ctrl_shift_v_pastes_clipboard_text() {
+        let events = vec![ctrl_shift_v_event()];
+
+        let events = terminal_paste_events(events, true, Some("pwd".to_owned()));
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], egui::Event::Text(text) if text == "pwd"));
+    }
+
+    #[test]
+    fn paste_event_wins_over_ctrl_shift_v_clipboard() {
+        let events = vec![
+            egui::Event::Paste("from-paste".to_owned()),
+            ctrl_shift_v_event(),
+        ];
+
+        let events = terminal_paste_events(events, true, Some("from-clipboard".to_owned()));
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], egui::Event::Text(text) if text == "from-paste"));
+    }
+
+    #[test]
+    fn terminal_paste_is_untouched_without_terminal_focus() {
+        let events = vec![
+            egui::Event::Paste("ls -la".to_owned()),
+            ctrl_v_event(),
+            ctrl_shift_v_event(),
+        ];
+
+        let events = terminal_paste_events(events, false, Some("pwd".to_owned()));
+
+        assert_eq!(events.len(), 3);
+        assert!(matches!(&events[0], egui::Event::Paste(text) if text == "ls -la"));
+        assert!(matches!(
+            &events[1],
+            egui::Event::Key {
+                key: egui::Key::V,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &events[2],
+            egui::Event::Key {
+                key: egui::Key::V,
+                ..
+            }
+        ));
     }
 
     #[test]
