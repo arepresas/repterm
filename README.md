@@ -31,7 +31,7 @@ A fast, simple terminal emulator built with Rust, egui, and egui_term.
 | Send a chat message | `Enter` |
 | Newline in the chat | `Shift+Enter` |
 | Cancel a streaming answer | "Cancel" button in the chat |
-| Copy selected text | Drag to select, then release the mouse |
+| Copy selected text | Drag to select, then release the mouse (`Shift`+drag when "Selection requires Shift" is on) |
 
 Click the branch chip to switch branches (writes `git checkout <branch>` into the active terminal), or the changes chip to open the diff panel. In the branch picker, type to filter, use `↑`/`↓` to navigate, `Enter` to select and `Esc` to cancel.
 
@@ -65,6 +65,13 @@ Drag over terminal output or a chat message to select it. Releasing the mouse
 copies the selection to the clipboard and shows a brief "Copied to clipboard"
 notice in the bottom-right corner. `Ctrl+Shift+C` still copies the terminal
 selection without dragging.
+
+TUIs such as opencode and Herdr capture the mouse. By default repterm still
+selects on a plain drag outside mouse-capture mode, which steals drags from
+those apps. Enable **Selection requires Shift** in Settings to invert this:
+`Shift`+drag always selects in repterm, while a plain drag goes to the app
+whenever it has enabled mouse capture. The setting is stored in
+`$XDG_CONFIG_HOME/repterm/settings.json` as `selection_requires_shift`.
 
 ## Git and GitHub
 

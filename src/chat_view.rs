@@ -91,7 +91,7 @@ pub fn tool_result_summary(content: &str) -> String {
 }
 
 /// Returns the fenced code blocks in `text`, trimmed of their trailing
-/// newline, so the UI can offer an "insert in terminal" action per block.
+/// newline, so the UI can offer "insert" and "execute" actions per block.
 pub fn code_blocks(text: &str) -> Vec<String> {
     let mut blocks = Vec::new();
     let mut current = String::new();
@@ -115,6 +115,12 @@ pub fn code_blocks(text: &str) -> Vec<String> {
     blocks
 }
 
+/// True when a code block is a single non-empty line, safe to send to the PTY
+/// as one command. Multi-line blocks stay insert-only.
+pub fn is_single_line_command(block: &str) -> bool {
+    !block.trim().is_empty() && !block.contains(['\n', '\r'])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,6 +139,20 @@ mod tests {
     fn code_blocks_returns_fenced_content_without_trailing_newline() {
         let blocks = code_blocks("antes\n```bash\ngit status\n```\ndespués");
         assert_eq!(blocks, vec!["git status".to_owned()]);
+    }
+
+    #[test]
+    fn single_line_command_accepts_one_non_empty_line() {
+        assert!(is_single_line_command("cargo test"));
+        assert!(is_single_line_command("  git status  "));
+    }
+
+    #[test]
+    fn single_line_command_rejects_empty_and_multiline_blocks() {
+        assert!(!is_single_line_command(""));
+        assert!(!is_single_line_command("   \n  "));
+        assert!(!is_single_line_command("git status\ngit diff"));
+        assert!(!is_single_line_command("git status\rgit diff"));
     }
 
     #[test]

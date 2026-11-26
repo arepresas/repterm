@@ -29,9 +29,16 @@ enum InputAction {
     Ignore,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PointerRoute {
+    Select,
+    MouseReport,
+    Ignore,
+}
+
 #[derive(Clone)]
 pub struct TerminalViewState {
-    is_dragged: bool,
+    active_route: Option<PointerRoute>,
     scroll_pixels: f32,
     current_mouse_position_on_grid: TerminalGridPoint,
     line_input: Option<String>,
@@ -43,7 +50,7 @@ pub struct TerminalViewState {
 impl Default for TerminalViewState {
     fn default() -> Self {
         Self {
-            is_dragged: false,
+            active_route: None,
             scroll_pixels: 0.0,
             current_mouse_position_on_grid: TerminalGridPoint::default(),
             line_input: Some(String::new()),
@@ -69,6 +76,7 @@ pub struct TerminalView<'a> {
     agent_conversation: bool,
     release_overlay: bool,
     clear_draft: bool,
+    selection_requires_shift: bool,
 }
 
 impl Widget for TerminalView<'_> {
@@ -115,6 +123,7 @@ impl<'a> TerminalView<'a> {
             agent_conversation: false,
             release_overlay: false,
             clear_draft: false,
+            selection_requires_shift: false,
         }
     }
 
@@ -159,6 +168,14 @@ impl<'a> TerminalView<'a> {
     #[inline]
     pub fn set_clear_draft(mut self, clear: bool) -> Self {
         self.clear_draft = clear;
+        self
+    }
+
+    /// Require Shift for repterm selection. Without it, plain drag goes to
+    /// apps that capture the mouse instead of selecting terminal text.
+    #[inline]
+    pub fn set_selection_requires_shift(mut self, enabled: bool) -> Self {
+        self.selection_requires_shift = enabled;
         self
     }
 
@@ -279,13 +296,20 @@ impl<'a> TerminalView<'a> {
                         modifiers,
                     ))
                 },
-                egui::Event::MouseWheel { unit, delta, .. } => input_actions
-                    .push(process_mouse_wheel(
-                        state,
-                        self.font.font_type().size,
-                        unit,
-                        delta,
-                    )),
+                egui::Event::MouseWheel {
+                    unit,
+                    delta,
+                    modifiers: wheel_modifiers,
+                    ..
+                } => input_actions.extend(process_mouse_wheel(
+                    state,
+                    self.backend,
+                    layout,
+                    self.font.font_type().size,
+                    unit,
+                    delta,
+                    wheel_modifiers,
+                )),
                 egui::Event::PointerButton {
                     button,
                     pressed,
@@ -301,6 +325,7 @@ impl<'a> TerminalView<'a> {
                     pos,
                     &modifiers,
                     pressed,
+                    self.selection_requires_shift,
                 )),
                 egui::Event::PointerMoved(pos) => {
                     input_actions = process_mouse_move(
@@ -1101,26 +1126,70 @@ fn process_keyboard_key(
 
 fn process_mouse_wheel(
     state: &mut TerminalViewState,
+    backend: &TerminalBackend,
+    layout: &Response,
     font_size: f32,
     unit: MouseWheelUnit,
     delta: Vec2,
-) -> InputAction {
-    match unit {
+    modifiers: Modifiers,
+) -> Vec<InputAction> {
+    let (scroll_delta, wheel_lines) = match unit {
         MouseWheelUnit::Line => {
             let lines = delta.y.signum() * delta.y.abs().ceil();
-            InputAction::BackendCall(BackendCommand::Scroll(lines as i32))
+            (lines as i32, lines.abs() as usize)
         },
         MouseWheelUnit::Point => {
             state.scroll_pixels -= delta.y;
             let lines = (state.scroll_pixels / font_size).trunc();
             state.scroll_pixels %= font_size;
-            if lines != 0.0 {
-                InputAction::BackendCall(BackendCommand::Scroll(-lines as i32))
-            } else {
-                InputAction::Ignore
-            }
+            (-lines as i32, lines.abs() as usize)
         },
-        MouseWheelUnit::Page => InputAction::Ignore,
+        MouseWheelUnit::Page => (0, if delta.y == 0.0 { 0 } else { 1 }),
+    };
+
+    if scroll_delta == 0 && wheel_lines == 0 {
+        return vec![InputAction::Ignore];
+    }
+
+    if backend
+        .last_content()
+        .terminal_mode
+        .intersects(TermMode::MOUSE_MODE)
+        && !modifiers.contains(Modifiers::SHIFT)
+    {
+        if let Some(position) = layout.ctx.input(|input| input.pointer.latest_pos()) {
+            let content = backend.last_content();
+            state.current_mouse_position_on_grid = TerminalBackend::selection_point(
+                position.x - layout.rect.min.x,
+                position.y - layout.rect.min.y,
+                &content.terminal_size,
+                content.grid.display_offset(),
+            );
+        }
+
+        let button = if delta.y > 0.0 {
+            MouseButton::ScrollUp
+        } else {
+            MouseButton::ScrollDown
+        };
+        return (0..wheel_lines)
+            .map(|_| {
+                InputAction::BackendCall(BackendCommand::MouseReport(
+                    button,
+                    modifiers,
+                    state.current_mouse_position_on_grid,
+                    true,
+                ))
+            })
+            .collect();
+    }
+
+    if scroll_delta == 0 {
+        vec![InputAction::Ignore]
+    } else {
+        vec![InputAction::BackendCall(BackendCommand::Scroll(
+            scroll_delta,
+        ))]
     }
 }
 
@@ -1133,6 +1202,7 @@ fn process_button_click(
     position: Pos2,
     modifiers: &Modifiers,
     pressed: bool,
+    selection_requires_shift: bool,
 ) -> InputAction {
     match button {
         PointerButton::Primary => process_left_button(
@@ -1143,8 +1213,37 @@ fn process_button_click(
             position,
             modifiers,
             pressed,
+            selection_requires_shift,
         ),
         _ => InputAction::Ignore,
+    }
+}
+
+fn primary_route(
+    mouse_mode: bool,
+    shift: bool,
+    selection_requires_shift: bool,
+) -> PointerRoute {
+    if selection_requires_shift {
+        if shift {
+            PointerRoute::Select
+        } else if mouse_mode {
+            PointerRoute::MouseReport
+        } else {
+            PointerRoute::Ignore
+        }
+    } else if mouse_mode && !shift {
+        PointerRoute::MouseReport
+    } else {
+        PointerRoute::Select
+    }
+}
+
+fn move_route(active: Option<PointerRoute>, mouse_motion: bool) -> PointerRoute {
+    match active {
+        Some(PointerRoute::Select) => PointerRoute::Select,
+        Some(PointerRoute::MouseReport) if mouse_motion => PointerRoute::MouseReport,
+        _ => PointerRoute::Ignore,
     }
 }
 
@@ -1156,71 +1255,89 @@ fn process_left_button(
     position: Pos2,
     modifiers: &Modifiers,
     pressed: bool,
+    selection_requires_shift: bool,
 ) -> InputAction {
     let terminal_mode = backend.last_content().terminal_mode;
-    if terminal_mode.intersects(TermMode::MOUSE_MODE) {
-        InputAction::BackendCall(BackendCommand::MouseReport(
-            MouseButton::LeftButton,
-            *modifiers,
-            state.current_mouse_position_on_grid,
-            pressed,
-        ))
-    } else if pressed {
-        process_left_button_pressed(state, layout, position)
-    } else {
-        process_left_button_released(
+    let route = primary_route(
+        terminal_mode.intersects(TermMode::MOUSE_MODE),
+        modifiers.contains(Modifiers::SHIFT),
+        selection_requires_shift,
+    );
+
+    if pressed {
+        state.active_route = match route {
+            PointerRoute::Ignore => None,
+            active => Some(active),
+        };
+        return match route {
+            PointerRoute::Select => {
+                InputAction::BackendCall(build_start_select_command(layout, position))
+            },
+            PointerRoute::MouseReport => InputAction::BackendCall(
+                BackendCommand::MouseReport(
+                    MouseButton::LeftButton,
+                    *modifiers,
+                    state.current_mouse_position_on_grid,
+                    true,
+                ),
+            ),
+            PointerRoute::Ignore => InputAction::Ignore,
+        };
+    }
+
+    match state.active_route.take() {
+        Some(PointerRoute::Select) => finish_selection(
             state,
             layout,
             backend,
             bindings_layout,
             position,
             modifiers,
-        )
+        ),
+        Some(PointerRoute::MouseReport) => InputAction::BackendCall(
+            BackendCommand::MouseReport(
+                MouseButton::LeftButton,
+                *modifiers,
+                state.current_mouse_position_on_grid,
+                false,
+            ),
+        ),
+        Some(PointerRoute::Ignore) | None => InputAction::Ignore,
     }
 }
 
-fn process_left_button_pressed(
-    state: &mut TerminalViewState,
-    layout: &Response,
-    position: Pos2,
-) -> InputAction {
-    state.is_dragged = true;
-    InputAction::BackendCall(build_start_select_command(layout, position))
-}
-
-fn process_left_button_released(
-    state: &mut TerminalViewState,
+fn finish_selection(
+    state: &TerminalViewState,
     layout: &Response,
     backend: &TerminalBackend,
     bindings_layout: &BindingsLayout,
     position: Pos2,
     modifiers: &Modifiers,
 ) -> InputAction {
-    state.is_dragged = false;
     if layout.double_clicked() || layout.triple_clicked() {
-        InputAction::BackendCall(build_start_select_command(layout, position))
-    } else {
-        let terminal_content = backend.last_content();
-        let binding_action = bindings_layout.get_action(
-            InputKind::Mouse(PointerButton::Primary),
-            *modifiers,
-            terminal_content.terminal_mode,
-        );
+        return InputAction::BackendCall(build_start_select_command(layout, position));
+    }
 
-        if binding_action == BindingAction::LinkOpen {
-            InputAction::BackendCall(BackendCommand::ProcessLink(
-                LinkAction::Open,
-                state.current_mouse_position_on_grid,
-            ))
+    let terminal_content = backend.last_content();
+    let binding_action = bindings_layout.get_action(
+        InputKind::Mouse(PointerButton::Primary),
+        *modifiers,
+        terminal_content.terminal_mode,
+    );
+
+    if binding_action == BindingAction::LinkOpen {
+        InputAction::BackendCall(BackendCommand::ProcessLink(
+            LinkAction::Open,
+            state.current_mouse_position_on_grid,
+        ))
+    } else {
+        // repterm: finish a drag selection by copying what the user
+        // highlighted. The host turns this into a visible confirmation.
+        let content = backend.selectable_content();
+        if content.trim().is_empty() {
+            InputAction::Ignore
         } else {
-            // repterm: finish a drag selection by copying what the user
-            // highlighted. The host turns this into a visible confirmation.
-            let content = backend.selectable_content();
-            if content.trim().is_empty() {
-                InputAction::Ignore
-            } else {
-                InputAction::WriteToClipboard(content)
-            }
+            InputAction::WriteToClipboard(content)
         }
     }
 }
@@ -1262,26 +1379,25 @@ fn process_mouse_move(
     );
 
     let mut actions = vec![];
-    // Handle command or selection update based on terminal mode and modifiers
-    if state.is_dragged {
-        let terminal_mode = terminal_content.terminal_mode;
-        let cmd = if terminal_mode.contains(TermMode::MOUSE_MOTION)
-            && modifiers.is_none()
-        {
-            InputAction::BackendCall(BackendCommand::MouseReport(
+    let route = move_route(
+        state.active_route,
+        terminal_content.terminal_mode.contains(TermMode::MOUSE_MOTION),
+    );
+    let cmd = match route {
+        PointerRoute::Select => InputAction::BackendCall(
+            BackendCommand::SelectUpdate(cursor_x, cursor_y),
+        ),
+        PointerRoute::MouseReport => InputAction::BackendCall(
+            BackendCommand::MouseReport(
                 MouseButton::LeftMove,
                 *modifiers,
                 state.current_mouse_position_on_grid,
                 true,
-            ))
-        } else {
-            InputAction::BackendCall(BackendCommand::SelectUpdate(
-                cursor_x, cursor_y,
-            ))
-        };
-
-        actions.push(cmd);
-    }
+            ),
+        ),
+        PointerRoute::Ignore => InputAction::Ignore,
+    };
+    actions.push(cmd);
 
     // Handle link hover if applicable
     if modifiers.command_only() {
@@ -1292,6 +1408,60 @@ fn process_mouse_move(
     }
 
     actions
+}
+
+#[cfg(test)]
+mod pointer_route_tests {
+    use super::{move_route, primary_route, PointerRoute};
+
+    #[test]
+    fn current_mode_plain_drag_in_mouse_mode_goes_to_app() {
+        assert_eq!(
+            primary_route(true, false, false),
+            PointerRoute::MouseReport
+        );
+    }
+
+    #[test]
+    fn current_mode_plain_drag_without_mouse_mode_selects() {
+        assert_eq!(primary_route(false, false, false), PointerRoute::Select);
+    }
+
+    #[test]
+    fn shift_mode_plain_drag_in_mouse_mode_goes_to_app() {
+        assert_eq!(primary_route(true, false, true), PointerRoute::MouseReport);
+    }
+
+    #[test]
+    fn shift_mode_plain_drag_without_mouse_mode_is_ignored() {
+        assert_eq!(primary_route(false, false, true), PointerRoute::Ignore);
+    }
+
+    #[test]
+    fn shift_mode_shift_drag_selects_even_in_mouse_mode() {
+        assert_eq!(primary_route(true, true, true), PointerRoute::Select);
+    }
+
+    #[test]
+    fn mouse_move_is_forwarded_only_for_mouse_drag_with_motion() {
+        assert_eq!(
+            move_route(Some(PointerRoute::MouseReport), true),
+            PointerRoute::MouseReport
+        );
+        assert_eq!(
+            move_route(Some(PointerRoute::MouseReport), false),
+            PointerRoute::Ignore
+        );
+        assert_eq!(move_route(None, true), PointerRoute::Ignore);
+    }
+
+    #[test]
+    fn selection_drag_keeps_updating_after_shift_is_released() {
+        assert_eq!(
+            move_route(Some(PointerRoute::Select), true),
+            PointerRoute::Select
+        );
+    }
 }
 
 #[cfg(test)]

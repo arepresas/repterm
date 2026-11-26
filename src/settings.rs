@@ -11,6 +11,7 @@ pub struct Settings {
     pub api_key: String,
     pub model: String,
     pub include_terminal_context: bool,
+    pub selection_requires_shift: bool,
 }
 
 impl std::fmt::Debug for Settings {
@@ -20,6 +21,7 @@ impl std::fmt::Debug for Settings {
             .field("api_key", &"<redacted>")
             .field("model", &self.model)
             .field("include_terminal_context", &self.include_terminal_context)
+            .field("selection_requires_shift", &self.selection_requires_shift)
             .finish()
     }
 }
@@ -31,6 +33,7 @@ impl Default for Settings {
             api_key: String::new(),
             model: String::new(),
             include_terminal_context: false,
+            selection_requires_shift: false,
         }
     }
 }
@@ -128,10 +131,12 @@ mod tests {
             api_key: "secret".into(),
             model: "gpt-4o-mini".into(),
             include_terminal_context: false,
+            selection_requires_shift: true,
         };
         s.save_to(&path).unwrap();
         assert_eq!(load_from(&path).api_key, "secret");
         assert!(!load_from(&path).include_terminal_context);
+        assert!(load_from(&path).selection_requires_shift);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -150,9 +155,27 @@ mod tests {
             loaded.include_terminal_context,
             Settings::default().include_terminal_context
         );
+        assert_eq!(
+            loaded.selection_requires_shift,
+            Settings::default().selection_requires_shift
+        );
 
         std::fs::write(&path, "{not json").unwrap();
         assert_eq!(load_from(&path), Settings::default());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn partial_file_keeps_selection_shift_flag() {
+        let dir = std::env::temp_dir().join(format!("repterm-shift-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("settings.json");
+
+        std::fs::write(&path, "{\"selection_requires_shift\":true}").unwrap();
+        let loaded = load_from(&path);
+        assert!(loaded.selection_requires_shift);
+        assert_eq!(loaded.base_url, Settings::default().base_url);
 
         std::fs::remove_dir_all(&dir).ok();
     }
