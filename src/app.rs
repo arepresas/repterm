@@ -13,9 +13,10 @@ use crate::tools::{
 };
 use alacritty_terminal::event::WindowSize;
 use alacritty_terminal::term::ClipboardType;
-use alacritty_terminal::vte::ansi::Rgb;
+use alacritty_terminal::vte::ansi::{self, NamedColor, Rgb};
 use egui_term::{
-    BackendCommand, Binding, BindingAction, InputKind, TerminalBackend, TerminalMode, TerminalView,
+    BackendCommand, Binding, BindingAction, InputKind, TerminalBackend, TerminalMode,
+    TerminalTheme, TerminalView,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -269,6 +270,7 @@ impl SettingsForm {
             api_key: self.api_key.clone(),
             model: self.model.trim().to_owned(),
             include_terminal_context: true,
+            selection_requires_shift: false,
         }
     }
 }
@@ -309,6 +311,7 @@ pub struct App {
     settings_open: bool,
     settings_form: SettingsForm,
     settings_include_terminal: bool,
+    settings_selection_shift: bool,
     settings_save_error: Option<String>,
     inline_agent_open: bool,
     agent_conversation: bool,
@@ -355,6 +358,7 @@ impl App {
             settings_open: false,
             settings_form: SettingsForm::from_settings(&settings),
             settings_include_terminal: settings.include_terminal_context,
+            settings_selection_shift: settings.selection_requires_shift,
             settings_save_error: None,
             inline_agent_open: false,
             agent_conversation: false,
@@ -375,6 +379,7 @@ impl App {
         self.picker = None;
         self.settings_form = SettingsForm::from_settings(&self.settings);
         self.settings_include_terminal = self.settings.include_terminal_context;
+        self.settings_selection_shift = self.settings.selection_requires_shift;
         self.settings_save_error = None;
         self.settings_open = true;
         self.load_models(ctx);
@@ -434,6 +439,7 @@ impl App {
 
         let mut form = self.settings_form.clone();
         let mut include = self.settings_include_terminal;
+        let mut selection_shift = self.settings_selection_shift;
         let mut action = SettingsAction::None;
         let save_error = self.settings_save_error.clone().unwrap_or_default();
         let models = self.model_list.clone();
@@ -509,6 +515,10 @@ impl App {
 
                 ui.checkbox(&mut include, "Include terminal context");
                 ui.weak("Includes the selection and latest lines. May contain secrets.");
+                ui.checkbox(&mut selection_shift, "Selection requires Shift")
+                    .on_hover_text(
+                        "Drag with Shift to select. Plain drag goes to apps that capture the mouse (opencode, Herdr).",
+                    );
                 if !save_error.is_empty() {
                     ui.colored_label(DEL_COLOR, &save_error);
                 }
@@ -524,6 +534,7 @@ impl App {
 
         self.settings_form = form;
         self.settings_include_terminal = include;
+        self.settings_selection_shift = selection_shift;
         self.settings_save_error = if save_error.is_empty() {
             None
         } else {
@@ -538,6 +549,7 @@ impl App {
                 Ok(()) => {
                     let mut settings = self.settings_form.to_settings();
                     settings.include_terminal_context = self.settings_include_terminal;
+                    settings.selection_requires_shift = self.settings_selection_shift;
                     match settings.save() {
                         Ok(()) => {
                             self.settings = settings;
@@ -1104,6 +1116,7 @@ impl App {
         let mut cancel = false;
         let mut retry = false;
         let mut insert: Option<String> = None;
+        let mut run: Option<String> = None;
         let composer_id = chat_composer_id();
 
         egui::Panel::top("chat_header")
@@ -1231,9 +1244,16 @@ impl App {
                             chat_bubble(ui, message, max_width, &visuals);
                             if message.role == Role::Assistant {
                                 for block in chat_view::code_blocks(&message.content) {
-                                    if ui.small_button("Insert into terminal").clicked() {
-                                        insert = Some(block);
-                                    }
+                                    ui.horizontal(|ui| {
+                                        if chat_view::is_single_line_command(&block)
+                                            && ui.small_button("Execute").clicked()
+                                        {
+                                            run = Some(block.clone());
+                                        }
+                                        if ui.small_button("Insert into terminal").clicked() {
+                                            insert = Some(block);
+                                        }
+                                    });
                                 }
                             }
                         }
@@ -1263,8 +1283,10 @@ impl App {
                 });
         });
 
-        let had_insert = insert.is_some();
-        if let Some(block) = insert {
+        let had_insert = insert.is_some() || run.is_some();
+        if let Some(block) = run {
+            self.run_bang(&block, ctx);
+        } else if let Some(block) = insert {
             self.insert_command(&block, ctx);
         }
         if cancel {
@@ -1675,7 +1697,7 @@ fn apply_action(action: Action, ctx: &egui::Context, tab_id: u64, tabs: &mut Tab
         Action::RespondColor(index, formatter) => {
             log::debug!("color request for index {index}");
             if let Some(tab) = tabs.tab_mut(tab_id) {
-                write_response(&mut tab.backend, formatter(foreground_color(ctx)));
+                write_response(&mut tab.backend, formatter(terminal_color(index)));
             }
         }
         Action::RespondSize(formatter) => {
@@ -1699,8 +1721,21 @@ fn read_clipboard() -> Result<String, arboard::Error> {
     arboard::Clipboard::new()?.get_text()
 }
 
-fn foreground_color(ctx: &egui::Context) -> Rgb {
-    let color = ctx.global_style().visuals.text_color();
+fn terminal_color(index: usize) -> Rgb {
+    let theme = TerminalTheme::default();
+    let color = match index {
+        i if i == NamedColor::Foreground as usize => {
+            theme.get_color(ansi::Color::Named(NamedColor::Foreground))
+        }
+        i if i == NamedColor::Background as usize => {
+            theme.get_color(ansi::Color::Named(NamedColor::Background))
+        }
+        i if i == NamedColor::Cursor as usize => {
+            theme.get_color(ansi::Color::Named(NamedColor::White))
+        }
+        0..=255 => theme.get_color(ansi::Color::Indexed(index as u8)),
+        _ => theme.get_color(ansi::Color::Named(NamedColor::Background)),
+    };
     Rgb {
         r: color.r(),
         g: color.g(),
@@ -2299,6 +2334,7 @@ impl eframe::App for App {
                         .set_agent_conversation(agent_tab_active && self.agent_conversation)
                         .set_release_overlay(agent_tab_active && self.agent_output_committed)
                         .set_clear_draft(exit_agent)
+                        .set_selection_requires_shift(self.settings.selection_requires_shift)
                         .add_bindings(ctrl_backspace_bindings());
                     ui.add(terminal);
                 } else {
@@ -2353,6 +2389,26 @@ mod tests {
     use std::collections::HashSet;
 
     use std::path::PathBuf;
+
+    #[test]
+    fn color_requests_use_terminal_palette() {
+        use alacritty_terminal::vte::ansi::NamedColor;
+
+        let background = super::terminal_color(NamedColor::Background as usize);
+        assert_eq!(
+            (background.r, background.g, background.b),
+            (0x18, 0x18, 0x18)
+        );
+
+        let foreground = super::terminal_color(NamedColor::Foreground as usize);
+        assert_eq!(
+            (foreground.r, foreground.g, foreground.b),
+            (0xd8, 0xd8, 0xd8)
+        );
+
+        let red = super::terminal_color(1);
+        assert_eq!((red.r, red.g, red.b), (0xac, 0x42, 0x42));
+    }
 
     #[test]
     fn agent_mode_is_only_active_on_its_originating_tab() {

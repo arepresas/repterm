@@ -58,7 +58,7 @@ impl From<TermMode> for MouseMode {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum MouseButton {
     LeftButton = 0,
     MiddleButton = 1,
