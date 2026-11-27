@@ -137,7 +137,7 @@ mod tests {
 
     #[test]
     fn code_blocks_returns_fenced_content_without_trailing_newline() {
-        let blocks = code_blocks("antes\n```bash\ngit status\n```\ndespués");
+        let blocks = code_blocks("before\n```bash\ngit status\n```\nafter");
         assert_eq!(blocks, vec!["git status".to_owned()]);
     }
 

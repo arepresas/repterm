@@ -65,8 +65,8 @@ fn parameters(properties: Value, required: &[&str]) -> Value {
 }
 
 pub fn tool_definitions() -> Vec<Value> {
-    let reason = json!({"type": "string", "description": "Motivo breve de la operación"});
-    let path = json!({"type": "string", "description": "Ruta del archivo o directorio"});
+    let reason = json!({"type": "string", "description": "Brief reason for the operation"});
+    let path = json!({"type": "string", "description": "Path to the file or directory"});
     let definition = |name: &str, description: &str, properties: Value, required: &[&str]| {
         json!({
             "type": "function",
@@ -80,25 +80,25 @@ pub fn tool_definitions() -> Vec<Value> {
     vec![
         definition(
             "list_dir",
-            "Lista un nivel de un directorio dentro del proyecto",
+            "List one level of a directory inside the project",
             json!({"path": path, "reason": reason}),
             &["path", "reason"],
         ),
         definition(
             "read_file",
-            "Lee un archivo de texto dentro del proyecto",
+            "Read a text file inside the project",
             json!({"path": path, "reason": reason}),
             &["path", "reason"],
         ),
         definition(
             "write_file",
-            "Crea o sobrescribe un archivo de texto dentro del proyecto",
+            "Create or overwrite a text file inside the project",
             json!({"path": path, "content": {"type": "string"}, "reason": reason}),
             &["path", "content", "reason"],
         ),
         definition(
             "edit_file",
-            "Sustituye una única aparición de texto en un archivo",
+            "Replace a single occurrence of text in a file",
             json!({
                 "path": path,
                 "old": {"type": "string"},
@@ -344,7 +344,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("repterm-write-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let args = format!(
-            r#"{{"path":"big.txt","content":"{}","reason":"prueba"}}"#,
+            r#"{{"path":"big.txt","content":"{}","reason":"test"}}"#,
             "x".repeat(MAX_WRITE_BYTES + 1)
         );
         let call = ToolCall {
@@ -364,19 +364,19 @@ mod tests {
         let write = ToolCall {
             id: "w".into(),
             name: "write_file".into(),
-            arguments: r#"{"path":"sub/a.txt","content":"hola","reason":"crear"}"#.into(),
+            arguments: r#"{"path":"sub/a.txt","content":"hello","reason":"create"}"#.into(),
         };
         let outcome = execute(&write, &root, None).unwrap();
         assert_eq!(outcome.changed_path.as_deref(), Some("sub/a.txt"));
         let read = ToolCall {
             id: "r".into(),
             name: "read_file".into(),
-            arguments: r#"{"path":"sub/a.txt","reason":"leer"}"#.into(),
+            arguments: r#"{"path":"sub/a.txt","reason":"read"}"#.into(),
         };
         assert!(execute(&read, &root, None)
             .unwrap()
             .content
-            .contains("hola"));
+            .contains("hello"));
         std::fs::remove_dir_all(&root).ok();
     }
 

@@ -1,10 +1,10 @@
-# Herramientas de archivos para el agente IA — Implementation Plan
+# File tools for the AI agent — Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Dar al chat de repterm herramientas de archivo limitadas al cwd de la pestaña activa, con un diálogo de permiso detallado para cualquier ruta fuera de ese directorio.
+**Goal:** Give repterm's chat file tools scoped to the active tab's cwd, with a detailed permission dialog for any path outside that directory.
 
-**Architecture:** `src/tools.rs` concentra el protocolo de herramientas, la resolución/cotención de rutas y la ejecución de `list_dir`/`read_file`/`write_file`/`edit_file`. `src/llm.rs` amplía el cliente SSE para tool calls fragmentados. `src/app.rs` posee la máquina de estados del turno (cwd fijado, rondas, permisos, cancelación) y el diálogo modal; `src/chat_view.rs` dibuja resúmenes de resultados.
+**Architecture:** `src/tools.rs` centralizes the tool protocol, path resolution/containment, and execution of `list_dir`/`read_file`/`write_file`/`edit_file`. `src/llm.rs` extends the SSE client for fragmented tool calls. `src/app.rs` owns the turn state machine (snapshotted cwd, rounds, permissions, cancellation) and the modal dialog; `src/chat_view.rs` draws result summaries.
 
 **Tech Stack:** Rust 2021, eframe/egui 0.31, ureq 3.5 + serde_json, pulldown-cmark 0.13, `std::thread` + `mpsc`.
 
@@ -12,48 +12,48 @@
 
 ## Global Constraints
 
-- Rust 2021; rustc/cargo 1.99.1; eframe/egui 0.31; `egui_term` vendorizado: no tocar `vendor/egui_term`.
-- Sin tokio: la petición HTTP sigue en un `std::thread` con `mpsc`; la espera a un permiso es estado en la UI, nunca un bloqueo.
-- Seguir los patrones existentes: `active_cwd()` (`src/app.rs:883-887`), `expand_home()` (`src/gitinfo.rs:48-60`), ventanas modales de `src/app.rs` y el cliente de `src/llm.rs:127-223`.
-- La clave de API no se escribe en logs ni en la conversación.
-- El cwd canonicalizado y el `tab_id` se fijan al iniciar el turno y se reutilizan en todas las rondas, aunque el usuario haga `cd` o cambie de pestaña.
-- Cuatro herramientas: `list_dir`, `read_file`, `write_file`, `edit_file`; todas requieren `reason: string`. No hay borrado.
-- Topes: 64 KiB de salida en `read_file`, 256 KiB en `write_file` y `edit_file`, 200 entradas en `list_dir`, 8 rondas por turno.
-- Fuera del cwd: diálogo con «Permitir una vez», «Permitir siempre esta ruta» (solo en memoria, por pareja operación+ruta) y «Rechazar». `Escape`/cerrar = rechazar. Una denegación detiene el resto de la ronda.
-- `README.md` tiene cambios ajenos sin commitear: **no añadirlo a ningún commit de este plan**.
+- Rust 2021; rustc/cargo 1.99.1; eframe/egui 0.31; vendored `egui_term`: do not touch `vendor/egui_term`.
+- No tokio: the HTTP request stays on a `std::thread` with `mpsc`; waiting for a permission is UI state, never a blocking wait.
+- Follow existing patterns: `active_cwd()` (`src/app.rs:883-887`), `expand_home()` (`src/gitinfo.rs:48-60`), the modal windows in `src/app.rs`, and the client in `src/llm.rs:127-223`.
+- The API key is never written to logs or the conversation.
+- The canonicalized cwd and `tab_id` are snapshotted at turn start and reused across all rounds, even if the user runs `cd` or switches tabs.
+- Four tools: `list_dir`, `read_file`, `write_file`, `edit_file`; all require `reason: string`. No deletion.
+- Limits: 64 KiB of output for `read_file`, 256 KiB for `write_file` and `edit_file`, 200 entries for `list_dir`, 8 rounds per turn.
+- Outside the cwd: dialog with "Allow once", "Allow always this path" (in memory only, per operation+path pair), and "Deny". `Escape`/close = deny. A denial stops the rest of the round.
+- `README.md` has unrelated uncommitted changes: **do not add it to any commit in this plan**.
 
 ## Review Focus
 
-- Un symlink dentro del cwd que apunta fuera, o un `..`, debe acabar en el diálogo de permiso, no en lectura/escritura silenciosa → Task 1, `canonicalized_symlink_outside_cwd_is_not_within`.
-- Un archivo binario o un `edit_file` con `old` no único debe devolver error al modelo sin escribir nada → Task 1, `edit_file_requires_unique_match_and_valid_utf8`.
-- Tool calls que llegan fragmentados en varios SSE deltas, con `id`/`name` partidos, deben reconstruirse completos → Task 2, `aggregates_split_tool_call_fragments`.
-- El recorte a 20 mensajes no debe separar un `assistant` con `tool_calls` de sus mensajes `tool` → Task 2, `build_messages_keeps_tool_call_pairs`.
-- Si el usuario rechaza una llamada con otras tres detrás, las tres restantes no se ejecutan y el modelo recibe el error → Task 3, `denial_stops_remaining_calls`.
-- Cerrar el chat durante una ronda cancela el bucle y descarta el permiso pendiente, sin dejar diálogos huérfanos → Task 3, `cancel_turn_clears_permission`.
-- Sin pestaña activa o sin cwd, la herramienta falla con mensaje claro y no abre diálogo → Task 3, `new_tool_turn_requires_active_cwd`.
+- A symlink inside the cwd that points outside, or a `..`, must end up in the permission dialog, not in a silent read/write → Task 1, `canonicalized_symlink_outside_cwd_is_not_within`.
+- A binary file or an `edit_file` with a non-unique `old` must return an error to the model without writing anything → Task 1, `edit_file_requires_unique_match_and_valid_utf8`.
+- Tool calls arriving fragmented across several SSE deltas, with split `id`/`name`, must be reassembled completely → Task 2, `aggregates_split_tool_call_fragments`.
+- Trimming to 20 messages must not separate an `assistant` with `tool_calls` from its `tool` messages → Task 2, `build_messages_keeps_tool_call_pairs`.
+- If the user denies a call with three more behind it, the remaining three are not executed and the model receives the error → Task 3, `denial_stops_remaining_calls`.
+- Closing the chat during a round cancels the loop and discards the pending permission, leaving no orphaned dialogs → Task 3, `cancel_turn_clears_permission`.
+- With no active tab or no cwd, the tool fails with a clear message and opens no dialog → Task 3, `new_tool_turn_requires_active_cwd`.
 
 ---
 
-### Task 1: Módulo de herramientas y política de rutas
+### Task 1: Tool module and path policy
 
 **Files:**
-- Create: `src/tools.rs` (con tests inline)
-- Modify: `src/main.rs` (añadir `mod tools;`)
+- Create: `src/tools.rs` (with inline tests)
+- Modify: `src/main.rs` (add `mod tools;`)
 
 **Interfaces:**
 - Consumes: `gitinfo::expand_home(text: &str, home: Option<&str>) -> Option<String>`.
 - Produces:
-  - `pub enum ToolName { ListDir, ReadFile, WriteFile, EditFile }` con `as_str() -> &'static str` y `from_str(&str) -> Option<Self>`.
+  - `pub enum ToolName { ListDir, ReadFile, WriteFile, EditFile }` with `as_str() -> &'static str` and `from_str(&str) -> Option<Self>`.
   - `pub struct ToolCall { pub id: String, pub name: String, pub arguments: String }`.
   - `pub struct ToolOutcome { pub call_id: String, pub content: String, pub changed_path: Option<String> }`.
-  - `pub struct PermissionKey { pub tool: ToolName, pub path: PathBuf }` (deriva `Clone, Debug, PartialEq, Eq, Hash`).
+  - `pub struct PermissionKey { pub tool: ToolName, pub path: PathBuf }` (derives `Clone, Debug, PartialEq, Eq, Hash`).
   - `pub fn tool_definitions() -> Vec<serde_json::Value>`.
   - `pub fn resolve_path(raw: &str, cwd: &Path, home: Option<&str>) -> Result<PathBuf, String>`.
   - `pub fn is_within(path: &Path, cwd: &Path) -> bool`.
   - `pub fn execute(call: &ToolCall, cwd: &Path, home: Option<&str>) -> Result<ToolOutcome, String>`.
-  - Constantes `pub const MAX_READ_BYTES: usize = 65_536;`, `pub const MAX_WRITE_BYTES: usize = 262_144;`, `pub const MAX_LIST_ENTRIES: usize = 200;`.
+  - Constants `pub const MAX_READ_BYTES: usize = 65_536;`, `pub const MAX_WRITE_BYTES: usize = 262_144;`, `pub const MAX_LIST_ENTRIES: usize = 200;`.
 
-- [ ] **Step 1: Escribir los tests que fallan en `src/tools.rs`**
+- [ ] **Step 1: Write the failing tests in `src/tools.rs`**
 
 ```rust
 #[test]
@@ -90,7 +90,7 @@ fn edit_file_requires_unique_match_and_valid_utf8() {
     let path = root.join("f.txt");
     std::fs::write(&path, "one\none\n").unwrap();
     let call = ToolCall { id: "c1".into(), name: "edit_file".into(),
-        arguments: r#"{"path":"f.txt","old":"one","new":"two","reason":"cambiar"}"#.into() };
+        arguments: r#"{"path":"f.txt","old":"one","new":"two","reason":"change"}"#.into() };
     assert!(execute(&call, &root, None).is_err());
     std::fs::write(&path, [0xff, 0xfe, 0x00]).unwrap();
     assert!(execute(&call, &root, None).is_err());
@@ -101,7 +101,7 @@ fn edit_file_requires_unique_match_and_valid_utf8() {
 fn write_file_rejects_content_over_limit() {
     let root = std::env::temp_dir().join(format!("repterm-write-{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
-    let args = format!(r#"{{"path":"big.txt","content":"{}","reason":"prueba"}}"#, "x".repeat(MAX_WRITE_BYTES + 1));
+    let args = format!(r#"{{"path":"big.txt","content":"{}","reason":"test"}}"#, "x".repeat(MAX_WRITE_BYTES + 1));
     let call = ToolCall { id: "c2".into(), name: "write_file".into(), arguments: args };
     assert!(execute(&call, &root, None).is_err());
     assert!(!root.join("big.txt").exists());
@@ -113,12 +113,12 @@ fn valid_write_and_read_roundtrip() {
     let root = std::env::temp_dir().join(format!("repterm-round-{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
     let write = ToolCall { id: "w".into(), name: "write_file".into(),
-        arguments: r#"{"path":"sub/a.txt","content":"hola","reason":"crear"}"#.into() };
+        arguments: r#"{"path":"sub/a.txt","content":"hello","reason":"create"}"#.into() };
     let outcome = execute(&write, &root, None).unwrap();
     assert_eq!(outcome.changed_path.as_deref(), Some("sub/a.txt"));
     let read = ToolCall { id: "r".into(), name: "read_file".into(),
-        arguments: r#"{"path":"sub/a.txt","reason":"leer"}"#.into() };
-    assert!(execute(&read, &root, None).unwrap().content.contains("hola"));
+        arguments: r#"{"path":"sub/a.txt","reason":"read"}"#.into() };
+    assert!(execute(&read, &root, None).unwrap().content.contains("hello"));
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -135,31 +135,31 @@ fn tool_definitions_cover_four_names_and_require_reason() {
 }
 ```
 
-- [ ] **Step 2: Verificar que fallan**
+- [ ] **Step 2: Verify that they fail**
 
 Run: `cargo test tools::tests`
-Expected: FAIL porque `src/tools.rs` no existe todavía.
+Expected: FAIL because `src/tools.rs` does not exist yet.
 
-- [ ] **Step 3: Crear el módulo con tipos, constantes y `tool_definitions`**
+- [ ] **Step 3: Create the module with types, constants, and `tool_definitions`**
 
-En `src/tools.rs` declara los tipos y constantes de Interfaces. `tool_definitions()` devuelve cuatro objetos `{"type":"function","function":{"name":…,"description":…,"parameters":{…}}}`. Cada `parameters` es `type:"object"` con `path` y `reason` obligatorios; `write_file` añade `content`, `edit_file` añade `old` y `new`, todos obligatorios. Las descripciones son frases breves en español. No escribas aún el cuerpo de `execute`.
+In `src/tools.rs`, declare the types and constants from Interfaces. `tool_definitions()` returns four objects `{"type":"function","function":{"name":…,"description":…,"parameters":{…}}}`. Each `parameters` is `type:"object"` with `path` and `reason` required; `write_file` adds `content`, `edit_file` adds `old` and `new`, all required. Descriptions are short phrases in English. Do not write the body of `execute` yet.
 
-- [ ] **Step 4: Implementar resolución y contención de rutas**
+- [ ] **Step 4: Implement path resolution and containment**
 
-`resolve_path` expande `~` con `expand_home`, une relativas a `cwd`, y canonicaliza; si no existe, canonicaliza el ancestor existente más cercano y reconstruye los componentes restantes. `is_within` compara componentes con `Path::starts_with` sobre rutas canonicalizadas.
+`resolve_path` expands `~` with `expand_home`, joins relative paths to `cwd`, and canonicalizes; if it does not exist, it canonicalizes the nearest existing ancestor and rebuilds the remaining components. `is_within` compares components with `Path::starts_with` on canonicalized paths.
 
-- [ ] **Step 5: Implementar `execute`**
+- [ ] **Step 5: Implement `execute`**
 
-Parsea `arguments` como `serde_json::Value` y exige `reason` no vacío. `read_file`: UTF-8 estricto, trunca a `MAX_READ_BYTES` e indica truncamiento. `write_file`: rechaza más de `MAX_WRITE_BYTES`, crea padres y sobrescribe; devuelve `changed_path` relativo a `cwd`. `edit_file`: comprueba metadata antes de leer, exige UTF-8 válido, cuenta apariciones de `old`, exige exactamente una, y devuelve `changed_path`. `list_dir`: un nivel, ordena, marca directorios con `/`, muestra tamaños de archivos y limita a `MAX_LIST_ENTRIES` indicando el recorte. Un nombre desconocido devuelve `Err`.
+Parse `arguments` as `serde_json::Value` and require a non-empty `reason`. `read_file`: strict UTF-8, truncates to `MAX_READ_BYTES` and indicates truncation. `write_file`: rejects more than `MAX_WRITE_BYTES`, creates parents and overwrites; returns `changed_path` relative to `cwd`. `edit_file`: checks metadata before reading, requires valid UTF-8, counts occurrences of `old`, requires exactly one, and returns `changed_path`. `list_dir`: one level, sorts, marks directories with `/`, shows file sizes, and limits to `MAX_LIST_ENTRIES` indicating the truncation. An unknown name returns `Err`.
 
-- [ ] **Step 6: Añadir el módulo al binario**
+- [ ] **Step 6: Add the module to the binary**
 
-En `src/main.rs`, añade `mod tools;` junto a los `mod` existentes.
+In `src/main.rs`, add `mod tools;` alongside the existing `mod` declarations.
 
-- [ ] **Step 7: Verificar los tests**
+- [ ] **Step 7: Verify the tests**
 
 Run: `cargo test tools::tests`
-Expected: PASS con los seis tests anteriores.
+Expected: PASS with the six tests above.
 
 - [ ] **Step 8: Commit**
 
@@ -170,7 +170,7 @@ git commit -m "feat: add scoped filesystem tools and path policy"
 
 ---
 
-### Task 2: Protocolo de tool calls en el cliente LiteLLM
+### Task 2: Tool call protocol in the LiteLLM client
 
 **Files:**
 - Modify: `src/llm.rs`
@@ -179,16 +179,16 @@ git commit -m "feat: add scoped filesystem tools and path policy"
 - Consumes: `tools::ToolCall`, `tools::tool_definitions()`.
 - Produces:
   - `Role::Tool`.
-  - `ChatMessage` con `pub tool_calls: Option<Vec<ToolCall>>` y `pub tool_call_id: Option<String>` (ambos `skip_serializing_if = "Option::is_none"`), más `pub fn assistant_tool_calls(calls: Vec<ToolCall>) -> Self` y `pub fn tool_result(call_id: impl Into<String>, content: impl Into<String>) -> Self`.
+  - `ChatMessage` with `pub tool_calls: Option<Vec<ToolCall>>` and `pub tool_call_id: Option<String>` (both `skip_serializing_if = "Option::is_none"`), plus `pub fn assistant_tool_calls(calls: Vec<ToolCall>) -> Self` and `pub fn tool_result(call_id: impl Into<String>, content: impl Into<String>) -> Self`.
   - `pub struct ToolCallFragment { pub index: usize, pub id: Option<String>, pub name: Option<String>, pub arguments: Option<String> }`.
   - `pub fn parse_tool_call_delta(frame: &str) -> Result<Vec<ToolCallFragment>, String>`.
   - `pub fn aggregate_tool_calls(fragments: &[ToolCallFragment]) -> Vec<ToolCall>`.
   - `pub fn completion_payload(model: &str, messages: &[ChatMessage], tools: &[serde_json::Value]) -> serde_json::Value`.
   - `StreamUpdate::ToolCalls(Vec<ToolCall>)`.
   - `LlmClient::stream(&self, model: &str, messages: &[ChatMessage], tx: &Sender<StreamUpdate>, tools: &[serde_json::Value]) -> Result<(), String>`.
-  - `build_messages(context: &str, history: &[ChatMessage]) -> Vec<ChatMessage>` (firma igual, nuevo agrupamiento).
+  - `build_messages(context: &str, history: &[ChatMessage]) -> Vec<ChatMessage>` (same signature, new grouping).
 
-- [ ] **Step 1: Escribir los tests que fallan**
+- [ ] **Step 1: Write the failing tests**
 
 ```rust
 #[test]
@@ -212,9 +212,9 @@ fn aggregates_split_tool_call_fragments() {
 #[test]
 fn build_messages_keeps_tool_call_pairs() {
     let history = vec![
-        ChatMessage::user("lee el archivo"),
+        ChatMessage::user("read the file"),
         ChatMessage::assistant_tool_calls(vec![ToolCall { id: "c1".into(), name: "read_file".into(), arguments: "{}".into() }]),
-        ChatMessage::tool_result("c1", "contenido"),
+        ChatMessage::tool_result("c1", "content"),
     ];
     let msgs = build_messages("CTX", &history);
     let roles: Vec<_> = msgs.iter().skip(1).map(|m| m.role).collect();
@@ -224,7 +224,7 @@ fn build_messages_keeps_tool_call_pairs() {
 #[test]
 fn completion_payload_includes_tools_when_nonempty() {
     let defs = tool_definitions();
-    let payload = completion_payload("m", &[ChatMessage::user("hola")], &defs);
+    let payload = completion_payload("m", &[ChatMessage::user("hello")], &defs);
     assert_eq!(payload["stream"], true);
     assert_eq!(payload["tool_choice"], "auto");
     assert_eq!(payload["tools"].as_array().unwrap().len(), 4);
@@ -240,35 +240,35 @@ fn system_prompt_describes_available_tools() {
 }
 ```
 
-- [ ] **Step 2: Verificar que fallan**
+- [ ] **Step 2: Verify that they fail**
 
 Run: `cargo test llm::tests`
-Expected: FAIL por símbolos y variantes aún no definidos.
+Expected: FAIL due to symbols and variants not yet defined.
 
-- [ ] **Step 3: Ampliar los tipos del protocolo**
+- [ ] **Step 3: Extend the protocol types**
 
-Añade `Role::Tool`, los dos campos opcionales y los constructores a `ChatMessage`, y la variante `StreamUpdate::ToolCalls(Vec<ToolCall>)`. Los constructores existentes dejan los nuevos campos a `None`. No cambies la firma de `stream` todavía.
+Add `Role::Tool`, the two optional fields and the constructors to `ChatMessage`, and the `StreamUpdate::ToolCalls(Vec<ToolCall>)` variant. Existing constructors leave the new fields as `None`. Do not change the `stream` signature yet.
 
-- [ ] **Step 4: Implementar parser y agregador**
+- [ ] **Step 4: Implement the parser and aggregator**
 
-`parse_tool_call_delta` lee `/choices/0/delta/tool_calls`, extrae `index` y los campos opcionales `id`, `type`, `function.name` y `function.arguments`; ignora frames sin tool calls. `aggregate_tool_calls` agrupa por `index` en orden de aparición, conserva el primer `id`/`name` no vacío y concatena los fragmentos de `arguments`.
+`parse_tool_call_delta` reads `/choices/0/delta/tool_calls`, extracts `index` and the optional fields `id`, `type`, `function.name`, and `function.arguments`; it ignores frames without tool calls. `aggregate_tool_calls` groups by `index` in order of appearance, keeps the first non-empty `id`/`name`, and concatenates the `arguments` fragments.
 
-- [ ] **Step 5: Implementar `completion_payload` y usarlo en `stream`**
+- [ ] **Step 5: Implement `completion_payload` and use it in `stream`**
 
-Construye el JSON con `model`, `stream: true`, `messages` y, solo si `tools` no está vacío, `tools` y `tool_choice: "auto"`. Cambia la firma de `stream` para recibir `tools` y usa `completion_payload`. En el bucle, acumula los fragmentos devueltos por `parse_tool_call_delta`; al recibir `[DONE]` o EOF, si hay fragmentos envía `StreamUpdate::ToolCalls(aggregate_tool_calls(...))`, si no envía `Done`. Mantén el comportamiento actual de `Delta`, `Error` y cancelación.
+Build the JSON with `model`, `stream: true`, `messages`, and — only if `tools` is non-empty — `tools` and `tool_choice: "auto"`. Change the `stream` signature to accept `tools` and use `completion_payload`. In the loop, accumulate the fragments returned by `parse_tool_call_delta`; on `[DONE]` or EOF, if there are fragments send `StreamUpdate::ToolCalls(aggregate_tool_calls(...))`, otherwise send `Done`. Keep the current behavior for `Delta`, `Error`, and cancellation.
 
-- [ ] **Step 6: Reescribir el system prompt**
+- [ ] **Step 6: Rewrite the system prompt**
 
-Sustituye la frase que niega herramientas por una descripción breve de las cuatro operaciones, la regla «solo el directorio de la pestaña; fuera se pide permiso» y la obligación de incluir `reason` en cada llamada.
+Replace the sentence that denies tools with a brief description of the four operations, the rule "only the tab's directory; permission is requested outside it", and the requirement to include `reason` in every call.
 
-- [ ] **Step 7: Ajustar `build_messages`**
+- [ ] **Step 7: Adjust `build_messages`**
 
-Agrupa cada `assistant` con `tool_calls` y sus mensajes `tool` posteriores como una unidad indivisible al aplicar `HISTORY_LIMIT = 20`. El mensaje `system` sigue refrescándose en cada petición.
+Group each `assistant` with `tool_calls` and its subsequent `tool` messages as an indivisible unit when applying `HISTORY_LIMIT = 20`. The `system` message is still refreshed on every request.
 
-- [ ] **Step 8: Verificar los tests**
+- [ ] **Step 8: Verify the tests**
 
 Run: `cargo test llm::tests`
-Expected: PASS con los cuatro tests anteriores y los tres preexistentes.
+Expected: PASS with the four tests above and the three pre-existing ones.
 
 - [ ] **Step 9: Commit**
 
@@ -279,7 +279,7 @@ git commit -m "feat: support streamed tool calls in LiteLLM client"
 
 ---
 
-### Task 3: Estado del turno, ejecución y permisos en la app
+### Task 3: Turn state, execution, and permissions in the app
 
 **Files:**
 - Modify: `src/app.rs`
@@ -291,12 +291,12 @@ git commit -m "feat: support streamed tool calls in LiteLLM client"
   - `pub struct ToolTurn { pub tab_id: u64, pub cwd: PathBuf, pub round: usize, pub calls: Vec<ToolCall>, pub outcomes: Vec<ToolOutcome>, pub next: usize, pub permission: Option<PermissionRequest>, pub stopped: bool }`.
   - `pub enum PermissionDecision { AllowOnce, AllowAlways, Deny }`.
   - `pub enum ToolAction { Execute(ToolCall), Ask(PermissionRequest), Finish }`.
-  - `ChatState` añade `pub turn: Option<ToolTurn>`.
-  - `App` añade `allowed_tools: HashSet<PermissionKey>`.
-  - Funciones libres: `fn new_tool_turn(tab_id: Option<u64>, cwd: Option<&str>) -> Result<ToolTurn, String>`, `fn next_tool_action(turn: &ToolTurn, allowed: &HashSet<PermissionKey>) -> ToolAction`, `fn apply_permission(turn: &mut ToolTurn, allowed: &mut HashSet<PermissionKey>, decision: PermissionDecision)`, `fn clear_tool_turn(chat: &mut ChatState)`.
-  - Métodos: `fn spawn_chat_request(&mut self, ctx: &egui::Context)`, `fn advance_tools(&mut self, ctx: &egui::Context)`, `fn resolve_permission(&mut self, decision: PermissionDecision, ctx: &egui::Context)`.
+  - `ChatState` adds `pub turn: Option<ToolTurn>`.
+  - `App` adds `allowed_tools: HashSet<PermissionKey>`.
+  - Free functions: `fn new_tool_turn(tab_id: Option<u64>, cwd: Option<&str>) -> Result<ToolTurn, String>`, `fn next_tool_action(turn: &ToolTurn, allowed: &HashSet<PermissionKey>) -> ToolAction`, `fn apply_permission(turn: &mut ToolTurn, allowed: &mut HashSet<PermissionKey>, decision: PermissionDecision)`, `fn clear_tool_turn(chat: &mut ChatState)`.
+  - Methods: `fn spawn_chat_request(&mut self, ctx: &egui::Context)`, `fn advance_tools(&mut self, ctx: &egui::Context)`, `fn resolve_permission(&mut self, decision: PermissionDecision, ctx: &egui::Context)`.
 
-- [ ] **Step 1: Escribir los tests que fallan en `src/app.rs`**
+- [ ] **Step 1: Write the failing tests in `src/app.rs`**
 
 ```rust
 #[test]
@@ -323,7 +323,7 @@ fn next_tool_action_asks_outside_and_executes_allowed() {
     let cwd = std::fs::canonicalize(&root).unwrap();
     let mut turn = ToolTurn { tab_id: 1, cwd: cwd.clone(), round: 1,
         calls: vec![ToolCall { id: "c1".into(), name: "read_file".into(),
-            arguments: r#"{"path":"/etc/hosts","reason":"diagnóstico"}"#.into() }],
+            arguments: r#"{"path":"/etc/hosts","reason":"diagnosis"}"#.into() }],
         outcomes: vec![], next: 0, permission: None, stopped: false };
     let mut allowed = HashSet::new();
     assert!(matches!(next_tool_action(&turn, &allowed), ToolAction::Ask(_)));
@@ -339,12 +339,12 @@ fn denial_stops_remaining_calls() {
     std::fs::create_dir_all(&root).unwrap();
     let cwd = std::fs::canonicalize(&root).unwrap();
     let call = |id: &str| ToolCall { id: id.into(), name: "read_file".into(),
-        arguments: r#"{"path":"/etc/hosts","reason":" diagnóstico"}"#.into() };
+        arguments: r#"{"path":"/etc/hosts","reason":" diagnosis"}"#.into() };
     let mut turn = ToolTurn { tab_id: 1, cwd, round: 1,
         calls: vec![call("a"), call("b"), call("c")], outcomes: vec![], next: 0,
         permission: Some(PermissionRequest { call: call("a"),
             key: PermissionKey { tool: ToolName::ReadFile, path: PathBuf::from("/etc/hosts") },
-            reason: "diagnóstico".into(), index: 1, total: 3 }), stopped: false };
+            reason: "diagnosis".into(), index: 1, total: 3 }), stopped: false };
     let mut allowed = HashSet::new();
     apply_permission(&mut turn, &mut allowed, PermissionDecision::Deny);
     turn.stopped = true;
@@ -371,35 +371,35 @@ fn cancel_turn_clears_permission() {
 }
 ```
 
-- [ ] **Step 2: Verificar que fallan**
+- [ ] **Step 2: Verify that they fail**
 
 Run: `cargo test app::tests`
-Expected: FAIL por tipos y funciones ausentes.
+Expected: FAIL due to missing types and functions.
 
-- [ ] **Step 3: Añadir los tipos y funciones puras**
+- [ ] **Step 3: Add the types and pure functions**
 
-Define los tipos de Interfaces en `src/app.rs`, añade `turn` a `ChatState` y `allowed_tools` a `App` (inicializado vacío en `new`). Implementa `new_tool_turn`, `next_tool_action` y `apply_permission`. `next_tool_action` devuelve `Ask` cuando la ruta canonicalizada está fuera del cwd y no está en `allowed`; `Execute` en caso contrario; `Finish` cuando `next >= calls.len()` o `stopped`. `AllowAlways` inserta la clave en `allowed`; `Deny` marca `stopped`, no inserta nada y limpia `permission`.
+Define the Interfaces types in `src/app.rs`, add `turn` to `ChatState` and `allowed_tools` to `App` (initialized empty in `new`). Implement `new_tool_turn`, `next_tool_action`, and `apply_permission`. `next_tool_action` returns `Ask` when the canonicalized path is outside the cwd and not in `allowed`; `Execute` otherwise; `Finish` when `next >= calls.len()` or `stopped`. `AllowAlways` inserts the key into `allowed`; `Deny` sets `stopped`, inserts nothing, and clears `permission`.
 
-- [ ] **Step 4: Conectar el streaming con el turno**
+- [ ] **Step 4: Connect streaming to the turn**
 
-En `send_chat`, antes de lanzar el hilo, crea el turno con `new_tool_turn(self.tabs.active(), self.active_cwd().as_deref())`; si falla, muestra el error y no envía. Guarda el turno en `chat.turn`. `spawn_chat_request` construye los mensajes con `build_messages(&self.chat_context(), &self.chat.messages)` y llama a `client.stream(..., &tool_definitions())` en el hilo, reutilizando el `cancel` actual.
+In `send_chat`, before spawning the thread, create the turn with `new_tool_turn(self.tabs.active(), self.active_cwd().as_deref())`; if it fails, show the error and do not send. Store the turn in `chat.turn`. `spawn_chat_request` builds the messages with `build_messages(&self.chat_context(), &self.chat.messages)` and calls `client.stream(..., &tool_definitions())` in the thread, reusing the current `cancel`.
 
-- [ ] **Step 5: Manejar `StreamUpdate::ToolCalls` en `poll_chat`**
+- [ ] **Step 5: Handle `StreamUpdate::ToolCalls` in `poll_chat`**
 
-Al recibir tool calls, guárdalos en `turn.calls`, conserva `partial` como texto del asistente y no cierres el turno. Al recibir `Done`: si `turn.calls` está vacío, cierra el turno como hoy; si no, añade el mensaje `assistant_tool_calls`, reinicia `partial`, y llama a `advance_tools`.
+On receiving tool calls, store them in `turn.calls`, keep `partial` as the assistant text, and do not close the turn. On `Done`: if `turn.calls` is empty, close the turn as today; otherwise, add the `assistant_tool_calls` message, reset `partial`, and call `advance_tools`.
 
-- [ ] **Step 6: Implementar `advance_tools` y `resolve_permission`**
+- [ ] **Step 6: Implement `advance_tools` and `resolve_permission`**
 
-`advance_tools` itera con `next_tool_action`: `Execute` llama a `execute`, guarda `ToolOutcome` y avanza; `Ask` guarda el `PermissionRequest` y espera; `Finish` añade un `ChatMessage::tool_result` por cada outcome (o un error explícito si hubo denegación), añade la nota «Archivo modificado: …» para los `changed_path`, y decide: si `stopped` o `round >= 8`, cierra el turno con un mensaje de aviso cuando corresponda; si no, incrementa `round` y vuelve a `spawn_chat_request`. `resolve_permission` aplica la decisión, limpia `permission` y reanuda `advance_tools`.
+`advance_tools` iterates with `next_tool_action`: `Execute` calls `execute`, stores the `ToolOutcome`, and advances; `Ask` stores the `PermissionRequest` and waits; `Finish` adds a `ChatMessage::tool_result` for each outcome (or an explicit error if there was a denial), adds the note "File modified: …" for `changed_path` entries, and decides: if `stopped` or `round >= 8`, it closes the turn with a notice message when appropriate; otherwise, it increments `round` and calls `spawn_chat_request` again. `resolve_permission` applies the decision, clears `permission`, and resumes `advance_tools`.
 
-- [ ] **Step 7: Cancelación y cierre**
+- [ ] **Step 7: Cancellation and closing**
 
-Implementa `clear_tool_turn` para dejar `chat.turn = None` sin tocar `allowed_tools`. Amplía `cancel_chat` para que limpie el turno **antes** del `let Some(rx) = ... else { return; }` actual, ponga `cancelled` y cancele el flag compartido. Haz que `close_chat` llame a `cancel_chat` cuando haya un turno en curso.
+Implement `clear_tool_turn` to set `chat.turn = None` without touching `allowed_tools`. Extend `cancel_chat` so it clears the turn **before** the current `let Some(rx) = ... else { return; }`, sets `cancelled`, and cancels the shared flag. Make `close_chat` call `cancel_chat` when a turn is in progress.
 
-- [ ] **Step 8: Verificar los tests y la compilación**
+- [ ] **Step 8: Verify the tests and the build**
 
 Run: `cargo test app::tests`
-Expected: PASS con los cinco tests anteriores y los existentes.
+Expected: PASS with the five tests above and the existing ones.
 
 - [ ] **Step 9: Commit**
 
@@ -410,65 +410,65 @@ git commit -m "feat: run agent file tools with scoped permissions"
 
 ---
 
-### Task 4: Diálogo de permiso y resultados en el chat
+### Task 4: Permission dialog and results in chat
 
 **Files:**
 - Modify: `src/app.rs`
 - Modify: `src/chat_view.rs`
 
 **Interfaces:**
-- Consumes: `PermissionRequest`, `PermissionDecision`, `ToolOutcome` de Tasks 1-3.
-- Produces: `pub fn tool_result_summary(content: &str) -> String` en `src/chat_view.rs`; `fn permission_rows(request: &PermissionRequest) -> [(&'static str, String); 4]` en `src/app.rs`; método `fn show_permission(&mut self, ctx: &egui::Context)`.
+- Consumes: `PermissionRequest`, `PermissionDecision`, `ToolOutcome` from Tasks 1-3.
+- Produces: `pub fn tool_result_summary(content: &str) -> String` in `src/chat_view.rs`; `fn permission_rows(request: &PermissionRequest) -> [(&'static str, String); 4]` in `src/app.rs`; method `fn show_permission(&mut self, ctx: &egui::Context)`.
 
-- [ ] **Step 1: Escribir los tests que fallan**
+- [ ] **Step 1: Write the failing tests**
 
-En `src/chat_view.rs`:
+In `src/chat_view.rs`:
 
 ```rust
 #[test]
 fn tool_result_summary_is_one_line() {
-    let summary = tool_result_summary("list_dir: 42 entradas\na.txt\nb.txt");
-    assert_eq!(summary, "list_dir: 42 entradas");
+    let summary = tool_result_summary("list_dir: 42 entries\na.txt\nb.txt");
+    assert_eq!(summary, "list_dir: 42 entries");
 }
 ```
 
-En `src/app.rs`:
+In `src/app.rs`:
 
 ```rust
 #[test]
 fn permission_rows_show_tool_path_cwd_and_reason() {
     let req = PermissionRequest { call: ToolCall { id: "c1".into(), name: "read_file".into(), arguments: "{}".into() },
         key: PermissionKey { tool: ToolName::ReadFile, path: PathBuf::from("/etc/hosts") },
-        reason: "diagnóstico".into(), index: 1, total: 2 };
+        reason: "diagnosis".into(), index: 1, total: 2 };
     let rows = permission_rows(&req);
-    assert_eq!(rows[0].0, "Herramienta");
+    assert_eq!(rows[0].0, "Tool");
     assert_eq!(rows[0].1, "read_file");
     assert_eq!(rows[1].1, "/etc/hosts");
-    assert_eq!(rows[3].1, "diagnóstico");
+    assert_eq!(rows[3].1, "diagnosis");
 }
 ```
 
-- [ ] **Step 2: Verificar que fallan**
+- [ ] **Step 2: Verify that they fail**
 
 Run: `cargo test tool_result_summary_is_one_line permission_rows_show_tool_path_cwd_and_reason`
-Expected: FAIL por funciones ausentes.
+Expected: FAIL due to missing functions.
 
-- [ ] **Step 3: Implementar el resumen de resultados**
+- [ ] **Step 3: Implement the result summary**
 
-`tool_result_summary` devuelve la primera línea del contenido, recortada a 100 caracteres, o `resultado de herramienta` si está vacío. En `show_chat`, los mensajes `Role::Tool` se dibujan con ese resumen en monospace y un botón «Ver» que expande el contenido completo; no se les añaden bloques «Insertar en terminal».
+`tool_result_summary` returns the first line of the content, truncated to 100 characters, or `tool result` if empty. In `show_chat`, `Role::Tool` messages are drawn with that summary in monospace and a "View" button that expands the full content; no "Insert into terminal" blocks are added to them.
 
-- [ ] **Step 4: Implementar `permission_rows` y el diálogo**
+- [ ] **Step 4: Implement `permission_rows` and the dialog**
 
-`permission_rows` devuelve las cuatro filas `Herramienta`, `Ruta`, `Directorio de la pestaña` y `Motivo`, con la ruta y el cwd en texto plano. `show_permission` dibuja un `egui::Window` no redimensionable de 420×220 con esas filas, un título `Permiso solicitado (1 de N)` y tres botones: «Permitir una vez», «Permitir siempre esta ruta» y «Rechazar». `Escape` y el cierre de la ventana se resuelven como `Deny`.
+`permission_rows` returns the four rows `Tool`, `Path`, `Tab directory`, and `Reason`, with the path and cwd in plain text. `show_permission` draws a non-resizable `egui::Window` of 420×220 with those rows, a title `Permission requested (1 of N)`, and three buttons: "Allow once", "Allow always this path", and "Deny". `Escape` and closing the window resolve as `Deny`.
 
-- [ ] **Step 5: Conectar precedencia y estado visual**
+- [ ] **Step 5: Wire up precedence and visual state**
 
-En `update`, cuando haya un permiso pendiente, consume `Escape` antes que cualquier otro atajo y dibuja `show_permission` antes que `show_chat`. En la cabecera del chat, muestra un punto ámbar con `ronda N/8` mientras `chat.turn.is_some()`. Desactiva el compositor y el botón «Enviar» mientras haya turno en curso, no solo mientras haya permiso.
+In `update`, when a permission is pending, consume `Escape` before any other shortcut and draw `show_permission` before `show_chat`. In the chat header, show an amber dot with `round N/8` while `chat.turn.is_some()`. Disable the composer and the "Send" button while a turn is in progress, not only while a permission is pending.
 
-- [ ] **Step 6: Verificar los tests**
+- [ ] **Step 6: Verify the tests**
 
 Run: `cargo test`
-Expected: PASS con los dos tests nuevos y toda la suite previa.
+Expected: PASS with the two new tests and the entire previous suite.
 
 - [ ] **Step 7: Commit**
 
@@ -479,44 +479,44 @@ git commit -m "feat: add permission dialog and tool result summaries"
 
 ---
 
-### Task 5: Verificación final y cierre
+### Task 5: Final verification and wrap-up
 
 **Files:**
-- Modify: solo si aparece algún fallo de verificación: `src/tools.rs`, `src/llm.rs`, `src/app.rs`, `src/chat_view.rs`.
+- Modify: only if a verification failure appears: `src/tools.rs`, `src/llm.rs`, `src/app.rs`, `src/chat_view.rs`.
 
 **Interfaces:**
-- Consumes: todas las anteriores.
+- Consumes: all of the above.
 
-- [ ] **Step 1: Formato**
+- [ ] **Step 1: Format**
 
 Run: `cargo fmt --all`
-Expected: termina sin errores.
+Expected: finishes without errors.
 
-- [ ] **Step 2: Comprobar formato**
+- [ ] **Step 2: Check formatting**
 
 Run: `cargo fmt --all -- --check`
-Expected: sin salida.
+Expected: no output.
 
-- [ ] **Step 3: Suite completa**
+- [ ] **Step 3: Full suite**
 
 Run: `cargo test`
-Expected: todos los tests pasan, incluidos los nuevos de tools, llm, app y chat_view.
+Expected: all tests pass, including the new ones in tools, llm, app, and chat_view.
 
-- [ ] **Step 4: Lint estricto**
+- [ ] **Step 4: Strict lint**
 
 Run: `cargo clippy --all-targets -- -D warnings`
-Expected: sin avisos.
+Expected: no warnings.
 
-- [ ] **Step 5: Comprobar diff y estado**
+- [ ] **Step 5: Check the diff and status**
 
 Run: `git status --short && git diff --stat a969321..HEAD`
-Expected: `README.md` sigue apareciendo como modificado pero **no** incluido en los commits del plan; el resto de archivos cambiados son los de este plan.
+Expected: `README.md` still appears as modified but is **not** included in the plan's commits; the rest of the changed files are those of this plan.
 
-- [ ] **Step 6: Revisión manual del diff completo**
+- [ ] **Step 6: Manual review of the full diff**
 
-Lee `git diff a969321..HEAD` buscando: rutas que puedan escapar del cwd sin permiso, tool calls que se pierdan al recortar historial, permisos que se persistenten por error, y mensajes de error que puedan incluir la clave de API. Anota cualquier hallazgo y corrígelo en un único commit si aparece.
+Read `git diff a969321..HEAD` looking for: paths that could escape the cwd without permission, tool calls lost when trimming history, permissions persisted by mistake, and error messages that could include the API key. Note any findings and fix them in a single commit if any appear.
 
-- [ ] **Step 7: Commit de correcciones (solo si hay cambios)**
+- [ ] **Step 7: Fix commit (only if there are changes)**
 
 ```bash
 git add src/tools.rs src/llm.rs src/app.rs src/chat_view.rs

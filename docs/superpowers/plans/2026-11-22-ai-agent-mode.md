@@ -1,54 +1,54 @@
-# Modo agente IA (LiteLLM) — Implementation Plan
+# AI Agent Mode (LiteLLM) — Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Añadir a repterm un modo chat con un modelo servido por LiteLLM, alternable desde el terminal con `Ctrl+Shift+Enter` o con `!`, que conversa con contexto del repo y propone comandos sin ejecutarlos automáticamente.
+**Goal:** Add a chat mode to repterm with a model served by LiteLLM, toggleable from the terminal with `Ctrl+Shift+Enter` or with `!`, that converses with repo context and proposes commands without executing them automatically.
 
-**Architecture:** `settings.rs` persiste URL/clave/modelo; `llm.rs` encapsula el cliente HTTP compatible con OpenAI y el parser SSE sobre un hilo `std::thread` + `mpsc` (sin tokio); `chat_view.rs` convierte markdown en `LayoutJob`; `app.rs` posee el estado del chat y decide qué superficie (terminal, chat o ajustes) recibe el foco y los eventos.
+**Architecture:** `settings.rs` persists URL/key/model; `llm.rs` encapsulates the OpenAI-compatible HTTP client and the SSE parser on a `std::thread` + `mpsc` thread (no tokio); `chat_view.rs` converts markdown into `LayoutJob`; `app.rs` owns the chat state and decides which surface (terminal, chat, or settings) receives focus and events.
 
-**Tech Stack:** Rust 2021, eframe/egui 0.31, egui_term vendorizado, ureq 3.5 (blocking + rustls), serde/serde_json, pulldown-cmark 0.13.
+**Tech Stack:** Rust 2021, eframe/egui 0.31, vendored egui_term, ureq 3.5 (blocking + rustls), serde/serde_json, pulldown-cmark 0.13.
 
 **Spec:** `docs/superpowers/specs/2026-11-22-ai-agent-mode-design.md`
 
 ## Global Constraints
 
-- Rust 2021; rustc/cargo 1.99.1; eframe/egui 0.31; no añadir tokio ni modificar `vendor/egui_term`.
-- `ureq = { version = "3.5", features = ["json"] }`; el streaming se consume desde un hilo con `std::sync::mpsc`, nunca en el hilo de la UI.
-- Archivo de ajustes en `$XDG_CONFIG_HOME/repterm/settings.json` o `~/.config/repterm/settings.json`, permisos `0600` en Unix; la clave no se escribe en logs ni en la conversación.
-- Base URL por defecto `http://localhost:4000/v1`; endpoint de modelos `GET {base_url}/models`; chat `POST {base_url}/chat/completions` con `stream: true`.
-- Contexto: system message refrescado cada turno + últimos 20 mensajes como máximo; `include_terminal_context = false` elimina últimas 120 líneas **y** selección.
-- Una conversación global en memoria; comandos dirigidos a la pestaña activa; aviso si no hay pestaña activa.
-- **Precondición:** el árbol de trabajo debe estar limpio antes del primer commit; si siguen los cambios sin commitear de la integración git, confirmar con el usuario cómo agruparlos.
+- Rust 2021; rustc/cargo 1.99.1; eframe/egui 0.31; do not add tokio or modify `vendor/egui_term`.
+- `ureq = { version = "3.5", features = ["json"] }`; streaming is consumed from a thread with `std::sync::mpsc`, never on the UI thread.
+- Settings file at `$XDG_CONFIG_HOME/repterm/settings.json` or `~/.config/repterm/settings.json`, permissions `0600` on Unix; the key is never written to logs or the conversation.
+- Default base URL `http://localhost:4000/v1`; models endpoint `GET {base_url}/models`; chat `POST {base_url}/chat/completions` with `stream: true`.
+- Context: system message refreshed each turn + at most the last 20 messages; `include_terminal_context = false` removes the last 120 lines **and** the selection.
+- One global in-memory conversation; commands targeted at the active tab; warning if there is no active tab.
+- **Precondition:** the working tree must be clean before the first commit; if uncommitted changes from the git integration remain, confirm with the user how to group them.
 
 ## Review Focus
 
-- `!` escrito a mitad de línea debe llegar al shell (expansión de historial): Task 3 prueba `is_bang_text_event` junto al flag `clean_line`.
-- SSE partido en varios chunks, `[DONE]` y frames de error: Task 2 prueba `parse_sse_frames` y `parse_delta`.
-- Ajustes ausentes o corruptos: Task 1 prueba `load_from` con archivo inexistente y JSON inválido.
-- Privacidad con `include_terminal_context = false`: Task 3 prueba que `build_context` omite selección y líneas.
-- Sin pestaña activa al enviar `!cmd`: Task 3 prueba `command_target(None)`; la UI muestra aviso y no escribe nada.
-- Bloqueos de código en la respuesta: Task 4 prueba que `markdown_layout` conserva el texto del código en monospace.
+- `!` typed mid-line must reach the shell (history expansion): Task 3 tests `is_bang_text_event` alongside the `clean_line` flag.
+- SSE split across multiple chunks, `[DONE]`, and error frames: Task 2 tests `parse_sse_frames` and `parse_delta`.
+- Missing or corrupt settings: Task 1 tests `load_from` with a nonexistent file and invalid JSON.
+- Privacy with `include_terminal_context = false`: Task 3 tests that `build_context` omits the selection and lines.
+- No active tab when sending `!cmd`: Task 3 tests `command_target(None)`; the UI shows a warning and writes nothing.
+- Code blocks in the response: Task 4 tests that `markdown_layout` preserves code text in monospace.
 
 ---
 
-### Task 1: Dependencias y ajustes persistentes
+### Task 1: Dependencies and Persistent Settings
 
 **Files:**
-- Modify: `Cargo.toml`, `src/main.rs` (añadir `mod settings;`)
-- Create: `src/settings.rs` (con tests inline)
+- Modify: `Cargo.toml`, `src/main.rs` (add `mod settings;`)
+- Create: `src/settings.rs` (with inline tests)
 
 **Interfaces:**
-- Consumes: nada.
+- Consumes: nothing.
 - Produces: `settings::Settings { pub base_url: String, pub api_key: String, pub model: String, pub include_terminal_context: bool }`; `impl Default`; `pub fn settings_path() -> PathBuf`; `pub fn load_from(path: &Path) -> Settings`; `pub fn save_to(&self, path: &Path) -> std::io::Result<()>`; `pub fn load() -> Settings`; `pub fn save(&self) -> std::io::Result<()>`.
 
-- [ ] **Step 1: Añadir dependencias y el módulo**
+- [ ] **Step 1: Add dependencies and the module**
 
-En `Cargo.toml`, bajo `[dependencies]`: `serde = { version = "1", features = ["derive"] }`, `serde_json = "1"`, `ureq = { version = "3.5", features = ["json"] }`, `pulldown-cmark = "0.13"`. En `src/main.rs`: `mod settings;`.
+In `Cargo.toml`, under `[dependencies]`: `serde = { version = "1", features = ["derive"] }`, `serde_json = "1"`, `ureq = { version = "3.5", features = ["json"] }`, `pulldown-cmark = "0.13"`. In `src/main.rs`: `mod settings;`.
 
 Run: `cargo check`
-Expected: compila (aunque `settings.rs` aún no exista: créalo vacío en este paso).
+Expected: compiles (even though `settings.rs` does not exist yet: create it empty in this step).
 
-- [ ] **Step 2: Escribir tests que fallan en `src/settings.rs`**
+- [ ] **Step 2: Write failing tests in `src/settings.rs`**
 
 ```rust
 #[test]
@@ -83,16 +83,16 @@ fn save_load_roundtrip_preserves_all_fields() {
 }
 ```
 
-- [ ] **Step 3: Verificar que fallan**
+- [ ] **Step 3: Verify that they fail**
 
 Run: `cargo test settings::tests`
-Expected: FAIL, `Settings`/`load_from` no definidos.
+Expected: FAIL, `Settings`/`load_from` undefined.
 
-- [ ] **Step 4: Implementar `settings.rs`**
+- [ ] **Step 4: Implement `settings.rs`**
 
-Deriva `Serialize, Deserialize, Debug, Clone, PartialEq` en `Settings`; `Default` con los valores de arriba. `settings_path()` usa `XDG_CONFIG_HOME` si existe, si no `HOME/.config`. `save_to` crea el directorio padre, usa `OpenOptions::new().write(true).create(true).truncate(true).mode(0o600)` bajo `cfg(unix)` y `serde_json::to_writer_pretty`. `load_from` lee con `serde_json::from_reader` y devuelve `Default` si falta o falla. `load()`/`save()` delegan en `settings_path()`. Ningún `log` incluye `api_key`.
+Derive `Serialize, Deserialize, Debug, Clone, PartialEq` on `Settings`; `Default` with the values above. `settings_path()` uses `XDG_CONFIG_HOME` if set, otherwise `HOME/.config`. `save_to` creates the parent directory, uses `OpenOptions::new().write(true).create(true).truncate(true).mode(0o600)` under `cfg(unix)` and `serde_json::to_writer_pretty`. `load_from` reads with `serde_json::from_reader` and returns `Default` if missing or on failure. `load()`/`save()` delegate to `settings_path()`. No `log` includes `api_key`.
 
-- [ ] **Step 5: Verificar que pasan**
+- [ ] **Step 5: Verify that they pass**
 
 Run: `cargo test settings::tests`
 Expected: 3 tests PASS.
@@ -104,17 +104,17 @@ git add Cargo.toml Cargo.lock src/main.rs src/settings.rs
 git commit -m "feat: add LiteLLM settings persistence"
 ```
 
-### Task 2: Cliente LiteLLM y parser SSE
+### Task 2: LiteLLM Client and SSE Parser
 
 **Files:**
-- Modify: `src/main.rs` (añadir `mod llm;`)
-- Create: `src/llm.rs` (con tests inline)
+- Modify: `src/main.rs` (add `mod llm;`)
+- Create: `src/llm.rs` (with inline tests)
 
 **Interfaces:**
-- Consumes: `settings::Settings` (Task 1) solo en la capa de UI.
-- Produces: `llm::Role { System, User, Assistant }` (serde lowercase); `llm::ChatMessage { pub role: Role, pub content: String }` con `fn system(text: impl Into<String>)`, `fn user(...)`, `fn assistant(...)`; `llm::StreamUpdate { Delta(String), Done, Error(String) }`; `llm::LlmClient { pub base_url: String, pub api_key: String, pub cancel: Arc<AtomicBool> }`; `pub const SYSTEM_PROMPT: &str`; `pub fn parse_sse_frames(input: &str) -> (Vec<String>, String)`; `pub fn parse_delta(frame: &str) -> Result<Option<String>, String>` (`Ok(None)` = `[DONE]`); `pub fn build_messages(context: &str, history: &[ChatMessage]) -> Vec<ChatMessage>`; `impl LlmClient { pub fn models(&self) -> Result<Vec<String>, String>; pub fn stream(&self, model: &str, messages: &[ChatMessage], tx: &Sender<StreamUpdate>) -> Result<(), String>; }`.
+- Consumes: `settings::Settings` (Task 1) only in the UI layer.
+- Produces: `llm::Role { System, User, Assistant }` (serde lowercase); `llm::ChatMessage { pub role: Role, pub content: String }` with `fn system(text: impl Into<String>)`, `fn user(...)`, `fn assistant(...)`; `llm::StreamUpdate { Delta(String), Done, Error(String) }`; `llm::LlmClient { pub base_url: String, pub api_key: String, pub cancel: Arc<AtomicBool> }`; `pub const SYSTEM_PROMPT: &str`; `pub fn parse_sse_frames(input: &str) -> (Vec<String>, String)`; `pub fn parse_delta(frame: &str) -> Result<Option<String>, String>` (`Ok(None)` = `[DONE]`); `pub fn build_messages(context: &str, history: &[ChatMessage]) -> Vec<ChatMessage>`; `impl LlmClient { pub fn models(&self) -> Result<Vec<String>, String>; pub fn stream(&self, model: &str, messages: &[ChatMessage], tx: &Sender<StreamUpdate>) -> Result<(), String>; }`.
 
-- [ ] **Step 1: Tests del parser y del historial**
+- [ ] **Step 1: Parser and history tests**
 
 ```rust
 #[test]
@@ -126,7 +126,7 @@ fn parse_sse_frames_handles_split_and_keeps_remainder() {
 
 #[test]
 fn parse_delta_extracts_text_done_and_errors() {
-    assert_eq!(parse_delta("{\"choices\":[{\"delta\":{\"content\":\"hola\"}}]}").unwrap(), Some("hola".into()));
+    assert_eq!(parse_delta("{\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}").unwrap(), Some("hello".into()));
     assert_eq!(parse_delta("[DONE]").unwrap(), None);
     assert!(parse_delta("{\"error\":{\"message\":\"boom\"}}").is_err());
 }
@@ -142,16 +142,16 @@ fn build_messages_refreshes_context_and_caps_history() {
 }
 ```
 
-- [ ] **Step 2: Verificar que fallan**
+- [ ] **Step 2: Verify that they fail**
 
 Run: `cargo test llm::tests`
-Expected: FAIL, módulo no definido.
+Expected: FAIL, module undefined.
 
-- [ ] **Step 3: Implementar `llm.rs`**
+- [ ] **Step 3: Implement `llm.rs`**
 
-`SYSTEM_PROMPT`: asistente dentro de un terminal, sin herramientas, comandos en bloques vallados, respuestas concisas. `parse_sse_frames` separa por `\n\n`, extrae líneas `data:` y conserva el resto. `parse_delta` usa `serde_json::Value`: si el frame es `[DONE]` devuelve `None`; si tiene `error.message` devuelve `Err`; si no `choices[0].delta.content` devuelve `Ok(None)`. `build_messages` construye un `ChatMessage::system` con `SYSTEM_PROMPT` + `\n\nCONTEXTO:\n{context}` y añade los últimos 20 mensajes no system. `models()` hace GET con `Authorization: Bearer` y parsea `data[].id`. `stream()` hace POST con JSON `{model, stream: true, messages}`, lee el cuerpo en trozos de 4096 bytes con `Read`, acumula en buffer, llama a `parse_sse_frames`, envía `Delta`/`Done`/`Error` por `tx` y comprueba `cancel.load(Ordering::Relaxed)` en cada iteración.
+`SYSTEM_PROMPT`: an assistant inside a terminal, no tools, commands in fenced blocks, concise answers. `parse_sse_frames` splits on `\n\n`, extracts `data:` lines and keeps the remainder. `parse_delta` uses `serde_json::Value`: if the frame is `[DONE]` it returns `None`; if it has `error.message` it returns `Err`; if there is no `choices[0].delta.content` it returns `Ok(None)`. `build_messages` builds a `ChatMessage::system` with `SYSTEM_PROMPT` + `\n\nCONTEXT:\n{context}` and appends the last 20 non-system messages. `models()` performs a GET with `Authorization: Bearer` and parses `data[].id`. `stream()` performs a POST with JSON `{model, stream: true, messages}`, reads the body in 4096-byte chunks with `Read`, accumulates in a buffer, calls `parse_sse_frames`, sends `Delta`/`Done`/`Error` over `tx`, and checks `cancel.load(Ordering::Relaxed)` on every iteration.
 
-- [ ] **Step 4: Verificar que pasan**
+- [ ] **Step 4: Verify that they pass**
 
 Run: `cargo test llm::tests`
 Expected: 3 tests PASS.
@@ -163,16 +163,16 @@ git add src/main.rs src/llm.rs
 git commit -m "feat: add LiteLLM streaming client and SSE parser"
 ```
 
-### Task 3: Estado del chat, cambio de modo y prefijo `!`
+### Task 3: Chat State, Mode Switching, and `!` Prefix
 
 **Files:**
 - Modify: `src/app.rs`
 
 **Interfaces:**
 - Consumes: `llm::{ChatMessage, LlmClient, StreamUpdate, build_messages}`; `settings::Settings`.
-- Produces en `app.rs`: `struct ChatState { pub messages: Vec<ChatMessage>, pub input: String, pub partial: String, pub error: Option<String>, pub cancelled: bool, pub cancel: Arc<AtomicBool>, pub rx: Option<Receiver<StreamUpdate>> }`; `impl ChatState { fn new() -> Self }`; `pub fn bang_command(input: &str) -> Option<&str>`; `fn is_bang_text_event(event: &egui::Event) -> bool`; `fn command_target(active: Option<u64>) -> Result<u64, ()>`; `fn build_context(repo: Option<&RepoStatus>, cwd: Option<&str>, selection: Option<&str>, lines: &[String], include_terminal: bool) -> String`; campos nuevos de `App`: `chat_open: bool`, `chat: ChatState`, `settings: Settings`, `settings_open: bool`, `line_clean: HashMap<u64, bool>`.
+- Produces in `app.rs`: `struct ChatState { pub messages: Vec<ChatMessage>, pub input: String, pub partial: String, pub error: Option<String>, pub cancelled: bool, pub cancel: Arc<AtomicBool>, pub rx: Option<Receiver<StreamUpdate>> }`; `impl ChatState { fn new() -> Self }`; `pub fn bang_command(input: &str) -> Option<&str>`; `fn is_bang_text_event(event: &egui::Event) -> bool`; `fn command_target(active: Option<u64>) -> Result<u64, ()>`; `fn build_context(repo: Option<&RepoStatus>, cwd: Option<&str>, selection: Option<&str>, lines: &[String], include_terminal: bool) -> String`; new `App` fields: `chat_open: bool`, `chat: ChatState`, `settings: Settings`, `settings_open: bool`, `line_clean: HashMap<u64, bool>`.
 
-- [ ] **Step 1: Tests puros en `app.rs`**
+- [ ] **Step 1: Pure tests in `app.rs`**
 
 ```rust
 #[test]
@@ -197,44 +197,44 @@ fn command_target_requires_active_tab() {
 
 #[test]
 fn context_respects_privacy_switch() {
-    let lines = vec!["SECRETO_LINEA".to_owned()];
-    let full = build_context(None, Some("/repo"), Some("SECRETO_SELECCION"), &lines, true);
-    let redacted = build_context(None, Some("/repo"), Some("SECRETO_SELECCION"), &lines, false);
-    assert!(full.contains("SECRETO_LINEA") && full.contains("SECRETO_SELECCION"));
+    let lines = vec!["SECRET_LINE".to_owned()];
+    let full = build_context(None, Some("/repo"), Some("SECRET_SELECTION"), &lines, true);
+    let redacted = build_context(None, Some("/repo"), Some("SECRET_SELECTION"), &lines, false);
+    assert!(full.contains("SECRET_LINE") && full.contains("SECRET_SELECTION"));
     assert!(redacted.contains("/repo"));
-    assert!(!redacted.contains("SECRETO_LINEA") && !redacted.contains("SECRETO_SELECCION"));
+    assert!(!redacted.contains("SECRET_LINE") && !redacted.contains("SECRET_SELECTION"));
 }
 ```
 
-- [ ] **Step 2: Verificar que fallan**
+- [ ] **Step 2: Verify that they fail**
 
 Run: `cargo test app::tests`
-Expected: FAIL, funciones no definidas.
+Expected: FAIL, functions undefined.
 
-- [ ] **Step 3: Añadir el estado a `App`**
+- [ ] **Step 3: Add the state to `App`**
 
-En `App::new()`: cargar `settings::load()`, inicializar `line_clean` vacío, `chat_open = false`, `chat = ChatState::new()` y `settings_open = false`.
+In `App::new()`: load `settings::load()`, initialize `line_clean` empty, `chat_open = false`, `chat = ChatState::new()`, and `settings_open = false`.
 
-- [ ] **Step 4: Implementar las funciones puras**
+- [ ] **Step 4: Implement the pure functions**
 
-Implementar `bang_command`, `is_bang_text_event`, `command_target` y `build_context` con las firmas anteriores. `build_context` incluye siempre cwd/rama/lista de `RepoStatus.changes` (ruta, staged, +/−) y solo incluye selección y líneas si `include_terminal` es true; trunca el bloque de terminal a un máximo de 8000 caracteres.
+Implement `bang_command`, `is_bang_text_event`, `command_target`, and `build_context` with the signatures above. `build_context` always includes cwd/branch/the `RepoStatus.changes` list (path, staged, +/−) and includes the selection and lines only if `include_terminal` is true; truncates the terminal block to a maximum of 8000 characters.
 
-- [ ] **Step 5: Cablear teclado y eventos en `App::update`**
+- [ ] **Step 5: Wire up keyboard and events in `App::update`**
 
-Antes de los paneles: si `settings_open` activo no procesar nada más; si no, consumir `Ctrl+Shift+Enter` con `i.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::Enter)` y alternar `chat_open`. En modo terminal, si `line_clean` de la pestaña activa es true, retirar de `ctx.input_mut(|i| &mut i.events)` el primer evento que cumpla `is_bang_text_event`; marcar `line_clean=false` y abrir el chat. Actualizar `line_clean` para la pestaña activa: `true` al detectar `Event::Key { key: Enter, pressed: true, .. }`, `false` al detectar texto imprimible distinto de `!`. Al añadir/quitar pestañas, sincronizar el mapa.
+Before the panels: if `settings_open` is active, process nothing else; otherwise, consume `Ctrl+Shift+Enter` with `i.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::Enter)` and toggle `chat_open`. In terminal mode, if `line_clean` for the active tab is true, remove from `ctx.input_mut(|i| &mut i.events)` the first event matching `is_bang_text_event`; set `line_clean=false` and open the chat. Update `line_clean` for the active tab: `true` when detecting `Event::Key { key: Enter, pressed: true, .. }`, `false` when detecting printable text other than `!`. When adding/removing tabs, sync the map.
 
-- [ ] **Step 6: Enviar y sondear respuestas**
+- [ ] **Step 6: Send and poll responses**
 
-`send_chat(&mut self, ctx)`: construir mensajes con `build_messages(&context, &self.chat.messages)`, clonar `LlmClient` desde `settings`, crear canal, `Arc::new(AtomicBool::new(false))`, marcar `streaming` implícito con `rx.is_some()`, limpiar `partial` y `error`, lanzar `std::thread::spawn` que llama a `client.stream(...)`. `poll_chat(&mut self, ctx)`: drenar `rx` con `try_recv`, acumular `Delta` en `partial`, `Done` empuja `ChatMessage::assistant(partial)` y cierra el canal, `Error` guarda el mensaje y cierra; llamar `ctx.request_repaint()` mientras haya stream activo. Cancelar: poner el flag en true, conservar `partial` como mensaje marcado `cancelled = true` y reabrir el compositor.
+`send_chat(&mut self, ctx)`: build messages with `build_messages(&context, &self.chat.messages)`, clone `LlmClient` from `settings`, create a channel, `Arc::new(AtomicBool::new(false))`, mark implicit `streaming` with `rx.is_some()`, clear `partial` and `error`, spawn `std::thread::spawn` that calls `client.stream(...)`. `poll_chat(&mut self, ctx)`: drain `rx` with `try_recv`, accumulate `Delta` into `partial`, `Done` pushes `ChatMessage::assistant(partial)` and closes the channel, `Error` stores the message and closes; call `ctx.request_repaint()` while a stream is active. Cancel: set the flag to true, keep `partial` as a message marked `cancelled = true`, and reopen the composer.
 
-- [ ] **Step 7: Escribir en el PTY al volver al terminal**
+- [ ] **Step 7: Write to the PTY when returning to the terminal**
 
-Si el compositor envía texto que empieza por `!`: `bang_command` extrae el comando; `command_target(self.tabs.active())` decide; si `Ok(id)`, `self.tabs.tab_mut(id).unwrap().backend.process_command(BackendCommand::Write(format!("{cmd}\n").into_bytes()))`, añadir eco local, `chat_open=false` y enfocar el terminal. Si `Err`, mostrar aviso en el chat y no escribir.
+If the composer submits text starting with `!`: `bang_command` extracts the command; `command_target(self.tabs.active())` decides; if `Ok(id)`, `self.tabs.tab_mut(id).unwrap().backend.process_command(BackendCommand::Write(format!("{cmd}\n").into_bytes()))`, add a local echo, set `chat_open=false`, and focus the terminal. If `Err`, show a warning in the chat and write nothing.
 
-- [ ] **Step 8: Verificar**
+- [ ] **Step 8: Verify**
 
 Run: `cargo test app::tests && cargo check`
-Expected: 4 tests PASS; compila.
+Expected: 4 tests PASS; compiles.
 
 - [ ] **Step 9: Commit**
 
@@ -243,44 +243,44 @@ git add src/app.rs
 git commit -m "feat: add chat mode state and bang toggle"
 ```
 
-### Task 4: Vista de chat y markdown
+### Task 4: Chat View and Markdown
 
 **Files:**
-- Create: `src/chat_view.rs` (con tests inline)
-- Modify: `src/main.rs` (añadir `mod chat_view;`), `src/app.rs` (método `show_chat`)
+- Create: `src/chat_view.rs` (with inline tests)
+- Modify: `src/main.rs` (add `mod chat_view;`), `src/app.rs` (`show_chat` method)
 
 **Interfaces:**
-- Consumes: `app::ChatState` y `llm::ChatMessage`.
+- Consumes: `app::ChatState` and `llm::ChatMessage`.
 - Produces: `chat_view::CHAT_ACCENT: Color32 = (116,93,215)`; `chat_view::markdown_layout(text: &str, visuals: &egui::Visuals) -> egui::text::LayoutJob`.
 
-- [ ] **Step 1: Test del layout markdown**
+- [ ] **Step 1: Markdown layout test**
 
 ```rust
 #[test]
 fn markdown_layout_keeps_inline_and_fenced_code_as_monospace() {
-    let job = markdown_layout("texto `a` y\n```\ngit status\n```", &egui::Visuals::dark());
+    let job = markdown_layout("text `a` and\n```\ngit status\n```", &egui::Visuals::dark());
     assert!(job.text.contains("git status"));
     assert!(job.sections.iter().any(|s| s.format.font_id == egui::FontId::monospace(12.0)));
 }
 ```
 
-- [ ] **Step 2: Verificar que falla**
+- [ ] **Step 2: Verify that it fails**
 
 Run: `cargo test chat_view::tests`
-Expected: FAIL, módulo no definido.
+Expected: FAIL, module undefined.
 
-- [ ] **Step 3: Implementar `markdown_layout`**
+- [ ] **Step 3: Implement `markdown_layout`**
 
-Usa `pulldown_cmark::Parser` (`Text`, `Code`, `Start(Tag::CodeBlock)`, `End`) y construye un `LayoutJob`: texto normal con `visuals.text_color`, código en `FontId::monospace(12.0)` con fondo `visuals.weak_bg_fill`; conserva los saltos de línea.
+Use `pulldown_cmark::Parser` (`Text`, `Code`, `Start(Tag::CodeBlock)`, `End`) and build a `LayoutJob`: normal text with `visuals.text_color`, code in `FontId::monospace(12.0)` with a `visuals.weak_bg_fill` background; preserve line breaks.
 
-- [ ] **Step 4: Implementar `App::show_chat`**
+- [ ] **Step 4: Implement `App::show_chat`**
 
-`CentralPanel` con cabecera ~34 px («AI chat», punto de estado verde/ámbar/rojo, modelo de solo lectura, botón ×, acceso a Ajustes), `ScrollArea::vertical().auto_shrink([false,false])` con burbujas usuario/asistente, cursor de bloque parpadeante en `partial`, eco `!cmd` monoespacio y banner de error con «Reintentar»; abajo `TextEdit` multilinea (44–160 px, monoespacio 13) + botón Enviar deshabilitado si está vacío o hay stream; `Enter` envía, `Shift+Enter` salto de línea; los bloques de código muestran un botón «Insertar en terminal» que escribe el texto sin Enter. Llamar `request_focus()` al entrar en chat y tras cada envío.
+`CentralPanel` with a ~34 px header («AI chat», green/amber/red status dot, read-only model, × button, access to Settings), `ScrollArea::vertical().auto_shrink([false,false])` with user/assistant bubbles, a blinking block cursor on `partial`, a monospace `!cmd` echo, and an error banner with «Retry»; at the bottom a multiline `TextEdit` (44–160 px, monospace 13) + a Send button disabled when empty or while streaming; `Enter` sends, `Shift+Enter` inserts a line break; code blocks show an «Insert into terminal» button that writes the text without Enter. Call `request_focus()` when entering chat and after each send.
 
-- [ ] **Step 5: Verificar**
+- [ ] **Step 5: Verify**
 
 Run: `cargo test chat_view::tests && cargo check`
-Expected: 1 test PASS; compila.
+Expected: 1 test PASS; compiles.
 
 - [ ] **Step 6: Commit**
 
@@ -289,7 +289,7 @@ git add src/main.rs src/chat_view.rs src/app.rs
 git commit -m "feat: render streaming chat panel with markdown"
 ```
 
-### Task 5: Modal de ajustes y descubrimiento de modelos
+### Task 5: Settings Modal and Model Discovery
 
 **Files:** Modify `src/app.rs`
 
@@ -297,7 +297,7 @@ git commit -m "feat: render streaming chat panel with markdown"
 - Consumes: `settings::{Settings, load, save}`; `llm::LlmClient::models`.
 - Produces: `struct SettingsForm { pub base_url: String, pub api_key: String, pub model: String, pub reveal_key: bool }`; `fn from_settings(&Settings) -> Self`; `fn validate(&self) -> Result<(), &'static str>`; `fn to_settings(&self) -> Settings`.
 
-- [ ] **Step 1: Tests de validación del formulario**
+- [ ] **Step 1: Form validation tests**
 
 ```rust
 #[test]
@@ -312,23 +312,23 @@ fn settings_form_requires_base_url_and_keeps_other_fields() {
 }
 ```
 
-- [ ] **Step 2: Verificar que falla**
+- [ ] **Step 2: Verify that it fails**
 
 Run: `cargo test app::tests::settings_form`
-Expected: FAIL, `SettingsForm` no definido.
+Expected: FAIL, `SettingsForm` undefined.
 
-- [ ] **Step 3: Implementar formulario y modal**
+- [ ] **Step 3: Implement the form and modal**
 
-`validate` solo exige `base_url` no vacío; `to_settings` conserva `include_terminal_context` de `self.settings`. `Window::new("Ajustes").resizable(false)` de ~460×340: Base URL, API key con `.password(!reveal_key)` y botón de ojo, `ComboBox` de modelos con opción manual, checkbox «Incluir contexto del terminal», Guardar/Cancelar. `Escape` cierra sin guardar; Guardar valida, llama `Settings::save()` y cierra; al guardar recargar `self.settings`. Al abrir ajustes, `self.picker = None`; mientras el modal esté abierto, el resto de `update` no procesa teclado.
+`validate` only requires a non-empty `base_url`; `to_settings` preserves `include_terminal_context` from `self.settings`. `Window::new("Settings").resizable(false)` at ~460×340: Base URL, API key with `.password(!reveal_key)` and an eye button, a model `ComboBox` with a manual option, an «Include terminal context» checkbox, Save/Cancel. `Escape` closes without saving; Save validates, calls `Settings::save()`, and closes; on save, reload `self.settings`. When opening settings, `self.picker = None`; while the modal is open, the rest of `update` does not process keyboard input.
 
-- [ ] **Step 4: Cargar modelos de forma asíncrona**
+- [ ] **Step 4: Load models asynchronously**
 
-Al abrir ajustes (y al pulsar «↻»), lanzar un hilo con `LlmClient { base_url, api_key, cancel: Arc::new(AtomicBool::new(false)) }.models()` y enviar `Vec<String>` por un nuevo `model_rx`. Mostrar «Cargando modelos…», y en error «Modelos no disponibles» con botón de reintento sin bloquear la entrada manual. Guardar el `model_rx` como campo de `App`.
+When opening settings (and when pressing «↻»), spawn a thread with `LlmClient { base_url, api_key, cancel: Arc::new(AtomicBool::new(false)) }.models()` and send `Vec<String>` over a new `model_rx`. Show «Loading models…», and on error «Models unavailable» with a retry button without blocking manual entry. Store `model_rx` as an `App` field.
 
-- [ ] **Step 5: Verificar**
+- [ ] **Step 5: Verify**
 
 Run: `cargo test app::tests && cargo check`
-Expected: tests PASS; compila.
+Expected: tests PASS; compiles.
 
 - [ ] **Step 6: Commit**
 
@@ -337,28 +337,28 @@ git add src/app.rs
 git commit -m "feat: add LiteLLM settings modal and model discovery"
 ```
 
-### Task 6: Documentación y verificación final
+### Task 6: Documentation and Final Verification
 
 **Files:** Modify `README.md`
 
-**Interfaces:** Consumes: comportamiento de Tasks 1–5.
+**Interfaces:** Consumes: behavior of Tasks 1–5.
 
-- [ ] **Step 1: Documentar los controles**
+- [ ] **Step 1: Document the controls**
 
-En Features añadir el modo agente con LiteLLM, contexto del repo, streaming y comandos propuestos. En Controls documentar `Ctrl+Shift+Enter`, `!` en terminal, `!cmd` en el chat, `Enter`/`Shift+Enter`, cancelación del streaming y dónde configurar URL/clave/modelo.
+In Features, add the agent mode with LiteLLM, repo context, streaming, and proposed commands. In Controls, document `Ctrl+Shift+Enter`, `!` in the terminal, `!cmd` in chat, `Enter`/`Shift+Enter`, stream cancellation, and where to configure URL/key/model.
 
-- [ ] **Step 2: Verificación completa**
+- [ ] **Step 2: Full verification**
 
 Run: `cargo fmt --all -- --check && cargo test && cargo clippy --all-targets -- -D warnings`
-Expected: sin diff de formato, todos los tests pasan, clippy sin errores.
+Expected: no formatting diff, all tests pass, clippy without errors.
 
-- [ ] **Step 3: Comprobación manual**
+- [ ] **Step 3: Manual check**
 
-Run: `cargo run` con el proxy LiteLLM disponible y una clave válida configurada desde Ajustes; abrir chat con `Ctrl+Shift+Enter` y con `!`, recibir un stream, cancelarlo, volver con `!git status`, insertar un comando propuesto y verificar que el `!` a mitad de línea llega al shell. Si no hay GUI o clave, documentar qué pasos quedaron sin ejecutar.
+Run: `cargo run` with the LiteLLM proxy available and a valid key configured from Settings; open chat with `Ctrl+Shift+Enter` and with `!`, receive a stream, cancel it, return with `!git status`, insert a proposed command, and verify that `!` mid-line reaches the shell. If there is no GUI or key, document which steps were not executed.
 
-- [ ] **Step 4: Revisión del diff**
+- [ ] **Step 4: Diff review**
 
-Run: revisar `git diff` del feature completo con el agente revisor disponible; corregir cualquier finding bloqueante antes del commit final.
+Run: review the `git diff` of the complete feature with the available reviewer agent; fix any blocking finding before the final commit.
 
 - [ ] **Step 5: Commit**
 

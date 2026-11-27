@@ -1,92 +1,92 @@
-# Herramientas de archivos para el agente IA en repterm — diseño
+# File tools for the AI agent in repterm — design
 
-## Intención y por qué
+## Intent and why
 
-El usuario quiere que el agente de repterm deje de limitarse a proponer comandos y pueda trabajar directamente sobre el proyecto abierto: leer archivos, crear otros nuevos y modificar los existentes. La condición que puso es un límite de ámbito, no un permiso general: «solo quiero q pueda acceder al directorio actual, para fuera debe pedir permiso explicitamente».
+The user wants the repterm agent to stop limiting itself to proposing commands and to be able to work directly on the open project: read files, create new ones, and modify existing ones. The condition they set is a scope limit, not a general permission: "I only want it to be able to access the current directory; outside of it, it must ask for permission explicitly".
 
-Cuando se le preguntó cómo debía ser ese permiso, eligió un diálogo detallado con botones: mostrar la herramienta, la ruta, el directorio de la pestaña y el motivo, y ofrecer permitir una vez, permitir siempre esa ruta o rechazar. Aceptó también los supuestos confirmados en la conversación: dentro del directorio no hay confirmación; «permitir siempre» vale solo para la sesión actual; al rechazar, el modelo recibe un error claro y puede seguir conversando.
+When asked how that permission should work, they chose a detailed dialog with buttons: show the tool, the path, the tab's directory, and the reason, and offer allow once, always allow that path, or reject. They also accepted the assumptions confirmed in the conversation: no confirmation inside the directory; "always allow" applies only to the current session; on rejection, the model receives a clear error and can continue the conversation.
 
-Esta spec amplía el modo agente ya implementado en `docs/superpowers/specs/2026-11-22-ai-agent-mode-design.md`. Mantiene su regla de que el modelo **no ejecuta comandos por su cuenta**.
+This spec extends the agent mode already implemented in `docs/superpowers/specs/2026-11-22-ai-agent-mode-design.md`. It keeps its rule that the model **does not execute commands on its own**.
 
-## Objetivos
+## Goals
 
-- Dar al modelo cuatro herramientas de archivos: `list_dir`, `read_file`, `write_file` y `edit_file`.
-- Resolver todas las rutas relativas al cwd de la pestaña activa; permitir libremente las que queden dentro de ese directorio.
-- Pedir permiso explícito mediante un diálogo modal detallado para cualquier operación cuya ruta canonicalizada quede fuera del cwd, incluidos los enlaces simbólicos que apunten fuera.
-- Soportar tool calls en streaming con la API compatible con OpenAI de LiteLLM, encadenando varias rondas de herramientas hasta que el modelo dé una respuesta final.
-- Recordar durante la sesión las rutas autorizadas con «permitir siempre», sin escribir esa lista en disco.
-- Informar en el chat de los archivos creados o modificados, para que el usuario pueda revisarlos con el panel de cambios ya existente.
+- Give the model four file tools: `list_dir`, `read_file`, `write_file`, and `edit_file`.
+- Resolve all paths relative to the active tab's cwd; freely allow those that fall inside that directory.
+- Request explicit permission through a detailed modal dialog for any operation whose canonicalized path falls outside the cwd, including symlinks that point outside.
+- Support streaming tool calls with LiteLLM's OpenAI-compatible API, chaining multiple tool rounds until the model gives a final response.
+- Remember paths authorized with "always allow" for the session, without writing that list to disk.
+- Report created or modified files in the chat so the user can review them with the existing changes panel.
 
-## No objetivos
+## Non-goals
 
-- Ejecución automática de comandos de shell; `!comando` sigue siendo una acción iniciada por el usuario en el PTY.
-- Borrar, renombrar, mover o cambiar permisos de archivos; operaciones de git (stage, commit, checkout); acceso a red más allá del propio LiteLLM.
-- Persistir los permisos «siempre» entre reinicios de repterm, ni ofrecer una interfaz para revocar la lista de la sesión: se reinicia al cerrar la app.
-- Aislamiento a nivel de sistema operativo (contenedores, sandbox, seccomp): el límite es una comprobación de rutas en la aplicación.
-- Vista previa de diffs dentro del diálogo de permiso; se deja para una versión posterior.
-- Varios diálogos de permiso simultáneos: se encolan y se muestran de uno en uno.
-- Incluir en este cambio el `README.md` con la sección de Oh My Zsh que el usuario dejó modificado pero sin commitear.
+- Automatic execution of shell commands; `!command` remains a user-initiated action in the PTY.
+- Deleting, renaming, moving, or changing file permissions; git operations (stage, commit, checkout); network access beyond LiteLLM itself.
+- Persisting "always" permissions across repterm restarts, or offering an interface to revoke the session list: it resets when the app closes.
+- Operating-system-level isolation (containers, sandbox, seccomp): the boundary is a path check in the application.
+- Diff previews inside the permission dialog; deferred to a later version.
+- Multiple simultaneous permission dialogs: they are queued and shown one at a time.
+- Including the `README.md` with the Oh My Zsh section in this change; the user left it modified but uncommitted.
 
-## Restricciones
+## Constraints
 
-- Rust 2021, rustc/cargo 1.99.1, eframe/egui 0.31, `egui_term` vendorizado: no tocar `vendor/egui_term`.
-- Sin tokio: el cliente HTTP ya usa `std::thread` + `mpsc` en `src/llm.rs:127-223`; la espera a un permiso debe ser estado en la UI, no un bloqueo del hilo.
-- Seguir los patrones existentes: ventanas modales de `src/app.rs` (`show_settings`, `show_picker`), `active_cwd()` en `src/app.rs:883-887`, `expand_home()` en `src/gitinfo.rs:48-60` y el formato de guardado de `src/settings.rs`.
-- La clave de API no debe aparecer nunca en logs ni en la conversación; los mensajes de herramienta no la incluyen.
-- El árbol de trabajo tiene un cambio ajeno sin commitear (`README.md`, Oh My Zsh); cualquier commit de este trabajo debe añadir solo sus propios archivos.
+- Rust 2021, rustc/cargo 1.99.1, eframe/egui 0.31, vendored `egui_term`: do not touch `vendor/egui_term`.
+- No tokio: the HTTP client already uses `std::thread` + `mpsc` in `src/llm.rs:127-223`; waiting for permission must be UI state, not a thread block.
+- Follow existing patterns: modal windows in `src/app.rs` (`show_settings`, `show_picker`), `active_cwd()` in `src/app.rs:883-887`, `expand_home()` in `src/gitinfo.rs:48-60`, and the save format in `src/settings.rs`.
+- The API key must never appear in logs or in the conversation; tool messages do not include it.
+- The working tree has an unrelated uncommitted change (`README.md`, Oh My Zsh); any commit for this work must add only its own files.
 
-## Decisiones tomadas
+## Decisions made
 
-1. **Protocolo de herramientas.** Peticiones OpenAI-compatible con `tools: [{type:"function", function:{name,description,parameters}}]` y `tool_choice: "auto"`. Los mensajes `assistant` pueden llevar `tool_calls: [{id,type:"function",function:{name,arguments}}]`; los resultados se devuelven como `role:"tool", tool_call_id, content`. Todas las definiciones y el parsing de fragmentos viven junto al cliente en `src/llm.rs` salvo que el constructor decida extraer un módulo propio.
+1. **Tool protocol.** OpenAI-compatible requests with `tools: [{type:"function", function:{name,description,parameters}}]` and `tool_choice: "auto"`. `assistant` messages may carry `tool_calls: [{id,type:"function",function:{name,arguments}}]`; results are returned as `role:"tool", tool_call_id, content`. All definitions and chunk parsing live alongside the client in `src/llm.rs` unless the implementer decides to extract a dedicated module.
 
-2. **Herramientas y sus argumentos.** `list_dir(path)`, `read_file(path)`, `write_file(path, content)` y `edit_file(path, old, new)`. Todas exigen además `reason: string`, una frase breve que se muestra tal cual en el diálogo. No existe una herramienta de borrado. `edit_file` exige que `old` aparezca una sola vez; si no aparece o aparece varias, devuelve un error al modelo sin escribir nada.
+2. **Tools and their arguments.** `list_dir(path)`, `read_file(path)`, `write_file(path, content)`, and `edit_file(path, old, new)`. All also require `reason: string`, a short phrase shown verbatim in the dialog. There is no delete tool. `edit_file` requires `old` to appear exactly once; if it is absent or appears multiple times, it returns an error to the model without writing anything.
 
-3. **Resolución de rutas.** `~` se expande con `expand_home`. Las rutas relativas se resuelven contra el cwd de la pestaña activa. Se usa `canonicalize` siempre que sea posible; para archivos que aún no existen se canonicaliza el ancestor existente más cercano y se reconstruye el resto. La ruta resultante debe empezar por el cwd canonicalizado. Un `..`, una ruta absoluta o un symlink que salga del directorio caen fuera y disparan el permiso. Sin pestaña activa, la herramienta devuelve un error y no abre diálogo, igual que `command_target(None)`.
+3. **Path resolution.** `~` is expanded with `expand_home`. Relative paths are resolved against the active tab's cwd. `canonicalize` is used whenever possible; for files that do not exist yet, the nearest existing ancestor is canonicalized and the rest is rebuilt. The resulting path must start with the canonicalized cwd. A `..`, an absolute path, or a symlink that escapes the directory falls outside and triggers permission. With no active tab, the tool returns an error and opens no dialog, just like `command_target(None)`.
 
-**Decisión confirmada por el usuario:** el cwd y la pestaña se fijan al iniciar el turno. Todas las llamadas de todas las rondas de ese turno usan el mismo cwd canonicalizado y el mismo `tab_id`, aunque el usuario haga `cd` o cambie de pestaña mientras tanto. El diálogo muestra siempre ese cwd fijado. Así el permiso «dentro del directorio» no puede ampliarse a mitad de petición.
+**User-confirmed decision:** the cwd and tab are fixed when the turn starts. All calls in all rounds of that turn use the same canonicalized cwd and the same `tab_id`, even if the user runs `cd` or switches tabs in the meantime. The dialog always shows that fixed cwd. This prevents the "inside the directory" permission from being widened mid-request.
 
-4. **Política de permisos.** Dentro del cwd: ejecución directa, sin diálogo. Fuera: se encola una petición con operación, ruta canonicalizada, cwd y motivo. El diálogo ofrece «Permitir una vez», «Permitir siempre esta ruta» (clave session-only por pareja operación+ruta canonicalizada) y «Rechazar». `Escape` y cerrar la ventana equivalen a rechazar. El rechazo se devuelve al modelo como contenido de herramienta indicando que el usuario lo denegó; el modelo puede continuar.
+4. **Permission policy.** Inside the cwd: direct execution, no dialog. Outside: a request is queued with the operation, canonicalized path, cwd, and reason. The dialog offers "Allow once", "Always allow this path" (session-only key per operation + canonicalized path pair), and "Reject". `Escape` and closing the window count as rejection. Rejection is returned to the model as tool content indicating the user denied it; the model can continue.
 
-5. **Bucle de herramientas.** Al terminar un streaming con `finish_reason = "tool_calls"`, no se cierra el turno: se ejecutan las herramientas en orden (pidiendo permiso cuando toque), se añaden el mensaje `assistant` con esas tool calls y los mensajes `tool` con sus resultados, y se lanza una nueva petición con el mismo contexto refrescado. Límite de 8 rondas por turno, decisión nuestra, para evitar bucles descontrolados; al alcanzarse se informa al usuario. Cancelar durante cualquier ronda detiene el bucle y conserva lo ya escrito, igual que la cancelación actual del streaming.
+5. **Tool loop.** When a stream ends with `finish_reason = "tool_calls"`, the turn does not close: the tools run in order (requesting permission when needed), the `assistant` message with those tool calls and the `tool` messages with their results are added, and a new request is sent with the same refreshed context. Limit of 8 rounds per turn — our decision — to avoid runaway loops; the user is informed when it is reached. Cancelling during any round stops the loop and keeps what has already been written, just like the current streaming cancellation.
 
-6. **Streaming y parser.** Los deltas `choices[0].delta.tool_calls` se agrupan por `index`: `id` y `function.name` suelen llegar en el primer fragmento y `function.arguments` se concatena. `finish_reason: "tool_calls"` llega antes de `data: [DONE]`. Se reutiliza `parse_sse_frames`; `parse_delta` se amplía sin romper los tests actuales de contenido. El recorte a 20 mensajes de `build_messages` no debe separar una tool call de su resultado.
+6. **Streaming and parser.** `choices[0].delta.tool_calls` deltas are grouped by `index`: `id` and `function.name` usually arrive in the first chunk and `function.arguments` is concatenated. `finish_reason: "tool_calls"` arrives before `data: [DONE]`. `parse_sse_frames` is reused; `parse_delta` is extended without breaking the current content tests. The 20-message truncation in `build_messages` must not separate a tool call from its result.
 
-7. **Diálogo (opción C elegida).** `Window` modal no redimensionable de unas 420×220 px, con filas `Herramienta`, `Ruta`, `Directorio de la pestaña` y `Motivo`, y tres botones horizontales. Si hay varias peticiones encoladas se muestra `1 de N`. El color de acento violeta y el estilo de botones son los ya usados en ajustes. Precedencia de teclado: permiso > ajustes > chat > pestañas > terminal. Mientras haya un permiso pendiente, el compositor y el botón de envío quedan desactivados; la cabecera del chat muestra un indicador ámbar con el número de rondas en curso.
+7. **Dialog (option C chosen).** Non-resizable modal `Window` of about 420×220 px, with rows `Tool`, `Path`, `Tab directory`, and `Reason`, and three horizontal buttons. If several requests are queued, `1 of N` is shown. The violet accent color and button style are the ones already used in settings. Keyboard precedence: permission > settings > chat > tabs > terminal. While a permission is pending, the composer and send button are disabled; the chat header shows an amber indicator with the number of rounds in progress.
 
-8. **Escritura y límites.** `write_file` crea los directorios padre que falten y sobrescribe el archivo; cuando el destino está fuera del cwd, el diálogo lo indica explícitamente. Para evitar bloqueos de la UI, `read_file` limita la salida a 64 KiB e informa de truncamiento, y `write_file` rechaza contenidos de más de 256 KiB con un error comprensible para el modelo. Estos tres números son decisión nuestra, no del usuario.
+8. **Writing and limits.** `write_file` creates any missing parent directories and overwrites the file; when the destination is outside the cwd, the dialog says so explicitly. To avoid UI stalls, `read_file` caps output at 64 KiB and reports truncation, and `write_file` rejects content over 256 KiB with an error the model can understand. These three numbers are our decision, not the user's.
 
-9. **Trazabilidad.** Después de cada `write_file` o `edit_file` con éxito se añade al chat una nota breve del tipo «Archivo modificado: `src/foo.rs`». No se muestra un diff completo: para eso está el panel de cambios existente. Las tool calls y sus resultados cuentan para el límite de 20 mensajes del historial.
+9. **Traceability.** After each successful `write_file` or `edit_file`, a short note such as "Modified file: `src/foo.rs`" is added to the chat. No full diff is shown: that is what the existing changes panel is for. Tool calls and their results count toward the 20-message history limit.
 
-10. **System prompt.** Se actualiza el prompt actual, que hoy prohíbe afirmar que hay herramientas, para describir las cuatro operaciones disponibles, la regla de ámbito y la obligación de incluir `reason`. No se expone como ajuste.
+10. **System prompt.** The current prompt, which today forbids claiming that tools exist, is updated to describe the four available operations, the scope rule, and the requirement to include `reason`. It is not exposed as a setting.
 
-11. **Resultados en el chat.** El contenido completo viaja al modelo en el mensaje `tool`, pero en la UI se muestra un resumen de una línea (`list_dir: 42 entradas`, `read_file: src/foo.rs, 3.1 KiB`) con un control para expandir el texto completo. Los mensajes de herramienta no se dibujan con los botones «Insertar en terminal» de los bloques de código. Decisión nuestra.
+11. **Results in chat.** The full content goes to the model in the `tool` message, but the UI shows a one-line summary (`list_dir: 42 entries`, `read_file: src/foo.rs, 3.1 KiB`) with a control to expand the full text. Tool messages are not drawn with the "Insert into terminal" buttons of code blocks. Our decision.
 
-12. **`list_dir`.** Un solo nivel, no recursivo; máximo 200 entradas ordenadas, con `/` para directorios y el tamaño para archivos; si hay más se indica el recorte. Decisión nuestra.
+12. **`list_dir`.** Single level, non-recursive; at most 200 sorted entries, with `/` for directories and the size for files; if there are more, the truncation is indicated. Our decision.
 
-13. **Archivos binarios.** `read_file` y `edit_file` exigen UTF-8 válido: si no lo es, devuelven un error claro al modelo, sin `from_utf8_lossy`. `edit_file` aplica el mismo límite de 256 KiB que `write_file`, comprobado por metadata antes de leer. Decisión nuestra.
+13. **Binary files.** `read_file` and `edit_file` require valid UTF-8: if it is not, they return a clear error to the model, without `from_utf8_lossy`. `edit_file` applies the same 256 KiB limit as `write_file`, checked via metadata before reading. Our decision.
 
-14. **Denegación parcial.** Si una llamada se rechaza, se detiene el resto de esa ronda: se devuelven los resultados de lo ya ejecutado y un error explícito para la llamada denegada; las siguientes no se ejecutan. Cada diálogo responde solo a su propia llamada. Decisión nuestra.
+14. **Partial denial.** If a call is rejected, the rest of that round stops: results for what has already run are returned along with an explicit error for the denied call; subsequent calls are not executed. Each dialog answers only its own call. Our decision.
 
-15. **Cierre del chat.** Pulsar × en la cabecera durante una ronda cancela el bucle y cualquier permiso pendiente, con efecto equivalente a rechazar. No se muestra un diálogo de permiso con el chat oculto, y no se aceptan mensajes nuevos mientras haya una ronda en curso. Decisión nuestra.
+15. **Closing the chat.** Pressing × in the header during a round cancels the loop and any pending permission, with the same effect as rejecting. No permission dialog is shown while the chat is hidden, and no new messages are accepted while a round is in progress. Our decision.
 
-## Interfaz (brief del diseñador)
+## Interface (designer brief)
 
-- El diálogo de permiso es una superficie nueva, distinta del modal de ajustes y del picker de ramas; solo aparece cuando el modelo pide una operación fuera del cwd.
-- Cuerpo con cuatro filas de etiqueta/valor en monospace para ruta y cwd; el motivo en texto normal. Botones alineados a la derecha, con «Rechazar» como acción segura por defecto al pulsar `Escape`.
-- La conversación sigue siendo la misma vista de chat; los resultados de herramientas se muestran como mensajes discretos, no como burbujas del usuario, y el estado ámbar desaparece al terminar el bucle.
+- The permission dialog is a new surface, distinct from the settings modal and the branch picker; it appears only when the model requests an operation outside the cwd.
+- Body with four label/value rows in monospace for the path and cwd; the reason in normal text. Buttons aligned to the right, with "Reject" as the safe default action when pressing `Escape`.
+- The conversation remains the same chat view; tool results appear as understated messages, not user bubbles, and the amber indicator disappears when the loop ends.
 
-## Lo que queda al constructor
+## Left to the implementer
 
-- Distribución exacta de widgets, espaciados y texto de los botones la fija el brief de UI; esta spec solo fija el comportamiento.
-- Dónde viven las definiciones JSON de las herramientas y si conviene extraer `src/tools.rs` para no engordar `src/llm.rs` o `src/app.rs`; cualquiera de las dos formas vale mientras no se solapen scopes de escritura.
-- Cómo se estructura internamente el estado de la máquina de estados del bucle de herramientas, siempre que la UI nunca bloquee esperando al usuario y `cancel_chat` lo limpie todo.
-- Pruebas unitarias obligatorias: fijación de cwd/tab al iniciar el turno, contención de rutas (incluye `..`, ruta absoluta y symlink que escapa), decisión de permiso y lista session-only, agregación de tool calls fragmentadas por SSE, transiciones del bucle (ejecutar → permiso → resultado → nueva petición), rechazo/cancelación (incluida la denegación a mitad de ronda), límites de tamaño, UTF-8 inválido y ausencia de pestaña activa.
-- La comprobación en vivo contra el proxy LiteLLM del usuario no es ejecutable en el entorno de desarrollo; se documentará como limitación.
+- Exact widget layout, spacing, and button text are set by the UI brief; this spec only fixes behavior.
+- Where the tool JSON definitions live and whether to extract `src/tools.rs` to avoid bloating `src/llm.rs` or `src/app.rs`; either approach is fine as long as write scopes do not overlap.
+- How the tool-loop state machine's state is structured internally, as long as the UI never blocks waiting for the user and `cancel_chat` clears everything.
+- Mandatory unit tests: cwd/tab pinning at turn start, path containment (including `..`, absolute path, and escaping symlink), permission decision and session-only list, aggregation of SSE-fragmented tool calls, loop transitions (execute → permission → result → new request), rejection/cancellation (including mid-round denial), size limits, invalid UTF-8, and absence of an active tab.
+- Live checking against the user's LiteLLM proxy is not executable in the development environment; it will be documented as a limitation.
 
-## Riesgos conocidos
+## Known risks
 
-- El modelo puede leer secretos dentro del cwd (por ejemplo `.env`) y reproducirlos en el chat. `include_terminal_context = false` no cubre este caso; el límite de confianza es el propio directorio que el usuario elige como cwd.
-- «Permitir siempre» solo recuerda la sesión: al reiniciar vuelven las preguntas. Es la contrapartida de no persistir autorizaciones en disco.
-- La plataforma LiteLLM puede variar en cómo propaga los deltas de tool calls; el parser debe tratar fragmentos parciales y no asumir que nombre e identificador llegan completos en el primer chunk.
-- Un modelo insistente podría encadenar muchas rondas; el límite de 8 y el botón de cancelación contienen el riesgo.
-- Leer o escribir archivos en el hilo de la UI puede producir micro-congelamientos; los límites de tamaño los reducen, pero una README muy grande seguirá siendo costosa.
+- The model can read secrets inside the cwd (for example `.env`) and reproduce them in the chat. `include_terminal_context = false` does not cover this case; the trust boundary is the directory the user chooses as cwd.
+- "Always allow" only remembers the session: the questions return after a restart. That is the trade-off for not persisting authorizations to disk.
+- The LiteLLM platform may vary in how it propagates tool-call deltas; the parser must handle partial chunks and not assume the name and identifier arrive complete in the first chunk.
+- A persistent model could chain many rounds; the limit of 8 and the cancel button contain the risk.
+- Reading or writing files on the UI thread can cause micro-freezes; the size limits reduce them, but a very large README will still be costly.
