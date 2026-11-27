@@ -1,0 +1,67 @@
+name: Feature request
+description: Suggest a new feature or an improvement to repterm
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the suggestion. Describe the problem you are trying to solve
+        before the solution — it helps us find the smallest change that works.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: What are you trying to do, and what gets in the way today?
+      placeholder: I cannot tell which tab owns a long-running process without clicking through every tab.
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: What would you like repterm to do? Include the interaction or shortcut if relevant.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches you thought about, and why you discarded them.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Tabs / PTY
+        - Git and GitHub status bar
+        - AI chat / LiteLLM
+        - Clipboard (OSC 52)
+        - Shell setup
+        - Build / install
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: criteria
+    attributes:
+      label: Success criteria
+      description: How do we know this is done? A short checklist works well.
+      placeholder: |
+        - [ ] New shortcut documented in the Controls table
+        - [ ] Works with the active tab's PTY without stealing focus
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: contribute
+    attributes:
+      label: Contribution
+      options:
+        - label: I would be willing to open a PR for this
+          required: false
