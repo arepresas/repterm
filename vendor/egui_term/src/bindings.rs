@@ -223,7 +223,7 @@ fn default_keyboard_bindings() -> Vec<(Binding<InputKind>, BindingAction)> {
         R,            Modifiers::CTRL; BindingAction::Char('\x12');
         S,            Modifiers::CTRL; BindingAction::Char('\x13');
         T,            Modifiers::CTRL; BindingAction::Char('\x14');
-        U,            Modifiers::CTRL; BindingAction::Char('\x51');
+        U,            Modifiers::CTRL; BindingAction::Char('\x15');
         V,            Modifiers::CTRL; BindingAction::Char('\x16');
         W,            Modifiers::CTRL; BindingAction::Char('\x17');
         X,            Modifiers::CTRL; BindingAction::Char('\x18');
@@ -291,7 +291,7 @@ fn default_keyboard_bindings() -> Vec<(Binding<InputKind>, BindingAction)> {
         R,        Modifiers::SHIFT | Modifiers::CTRL; BindingAction::Char('\x12');
         S,        Modifiers::SHIFT | Modifiers::CTRL; BindingAction::Char('\x13');
         T,        Modifiers::SHIFT | Modifiers::CTRL; BindingAction::Char('\x14');
-        U,        Modifiers::SHIFT | Modifiers::CTRL; BindingAction::Char('\x51');
+        U,        Modifiers::SHIFT | Modifiers::CTRL; BindingAction::Char('\x15');
         V,        Modifiers::SHIFT | Modifiers::CTRL; BindingAction::Char('\x16');
         W,        Modifiers::SHIFT | Modifiers::CTRL; BindingAction::Char('\x17');
         X,        Modifiers::SHIFT | Modifiers::CTRL; BindingAction::Char('\x18');
@@ -451,6 +451,21 @@ mod tests {
                     bind == &custom_bind && action == &custom_action
                 });
             assert!(found_binding.is_some());
+        }
+    }
+
+    #[test]
+    fn ctrl_u_sends_ctrl_u_byte() {
+        let current_layout = BindingsLayout::default();
+        for modifiers in [Modifiers::CTRL, Modifiers::SHIFT | Modifiers::CTRL] {
+            assert_eq!(
+                current_layout.get_action(
+                    InputKind::KeyCode(Key::U),
+                    modifiers,
+                    TerminalMode::empty(),
+                ),
+                BindingAction::Char('\x15')
+            );
         }
     }
 

@@ -98,8 +98,14 @@ mod tests {
 
     #[test]
     fn history_entries_always_start_with_bang() {
-        assert_eq!(history_entry_text("dime qué hay"), "!dime qué hay");
-        assert_eq!(history_entry_text(" !dime qué hay "), "!dime qué hay");
-        assert_eq!(history_entry_text("!!cosa"), "!!cosa");
+        assert_eq!(
+            history_entry_text("tell me what's there"),
+            "!tell me what's there"
+        );
+        assert_eq!(
+            history_entry_text(" !tell me what's there "),
+            "!tell me what's there"
+        );
+        assert_eq!(history_entry_text("!!thing"), "!!thing");
     }
 }

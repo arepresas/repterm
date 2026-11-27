@@ -9,14 +9,14 @@ use crate::tools::ToolCall;
 
 /// System prompt used for every request. The terminal context is appended
 /// after it by [`build_messages`].
-pub const SYSTEM_PROMPT: &str = "Eres un asistente integrado dentro de un terminal. \
-Puedes usar las herramientas list_dir, read_file, write_file y edit_file para trabajar \
-en archivos. Solo puedes acceder al directorio de la pestaña activa; para cualquier \
-ruta fuera de él se pedirá permiso al usuario. No ejecutes comandos de shell por tu cuenta; \
-cuando propongas uno, escríbelo en un bloque de código vallado (```). \
-Incluye siempre un `reason` breve que explique por qué usas cada herramienta. \
-Sé conciso y directo; evita explicaciones largas salvo que se pidan. \
-Responde en el idioma del usuario.";
+pub const SYSTEM_PROMPT: &str = "You are an assistant embedded in a terminal. \
+You can use the list_dir, read_file, write_file, and edit_file tools to work \
+with files. You can only access the active tab's directory; any path outside \
+it requires the user's permission. Do not run shell commands on your own; \
+when you propose one, write it in a fenced code block (```). \
+Always include a brief `reason` explaining why you use each tool. \
+Be concise and direct; avoid long explanations unless asked. \
+Respond in the user's language.";
 
 const HISTORY_LIMIT: usize = 20;
 
@@ -479,7 +479,7 @@ pub fn parse_delta(frame: &str) -> Result<Option<String>, String> {
 pub fn build_messages(context: &str, history: &[ChatMessage]) -> Vec<ChatMessage> {
     let mut messages = Vec::with_capacity(HISTORY_LIMIT + 1);
     messages.push(ChatMessage::system(format!(
-        "{SYSTEM_PROMPT}\n\nCONTEXTO:\n{context}"
+        "{SYSTEM_PROMPT}\n\nCONTEXT:\n{context}"
     )));
 
     let mut units: Vec<Vec<&ChatMessage>> = Vec::new();
@@ -516,8 +516,8 @@ mod tests {
     #[test]
     fn parse_delta_extracts_text_done_and_errors() {
         assert_eq!(
-            parse_delta("{\"choices\":[{\"delta\":{\"content\":\"hola\"}}]}").unwrap(),
-            Some("hola".into())
+            parse_delta("{\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}").unwrap(),
+            Some("hello".into())
         );
         assert_eq!(parse_delta("[DONE]").unwrap(), None);
         assert!(parse_delta("{\"error\":{\"message\":\"boom\"}}").is_err());
@@ -551,7 +551,7 @@ mod tests {
             cancel: Arc::new(AtomicBool::new(false)),
         };
         let (tx, rx) = mpsc::channel();
-        let messages = [ChatMessage::user("hola")];
+        let messages = [ChatMessage::user("hello")];
         client
             .stream("model", &messages, &tx, &tool_definitions())
             .unwrap();
@@ -616,7 +616,7 @@ mod tests {
     #[test]
     fn build_messages_keeps_tool_call_pairs() {
         let history = vec![
-            ChatMessage::user("lee el archivo"),
+            ChatMessage::user("read the file"),
             ChatMessage::assistant_tool_calls(vec![ToolCall {
                 id: "c1".into(),
                 name: "read_file".into(),
@@ -632,7 +632,7 @@ mod tests {
     #[test]
     fn completion_payload_includes_tools_when_nonempty() {
         let defs = tool_definitions();
-        let payload = completion_payload("m", &[ChatMessage::user("hola")], &defs);
+        let payload = completion_payload("m", &[ChatMessage::user("hello")], &defs);
         assert_eq!(payload["stream"], true);
         assert_eq!(payload["tool_choice"], "auto");
         assert_eq!(payload["tools"].as_array().unwrap().len(), 4);

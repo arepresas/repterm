@@ -21,6 +21,8 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([900.0, 600.0])
             .with_min_inner_size([320.0, 240.0]),
+        // Let Ctrl+C/V/X reach the PTY; repterm uses Ctrl+Shift for clipboard.
+        clipboard_shortcuts: false,
         ..Default::default()
     };
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/repterm.png"))

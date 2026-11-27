@@ -31,7 +31,11 @@ A fast, simple terminal emulator built with Rust, egui, and egui_term.
 | Send a chat message | `Enter` |
 | Newline in the chat | `Shift+Enter` |
 | Cancel a streaming answer | "Cancel" button in the chat |
-| Copy selected text | Drag to select, then release the mouse (`Shift`+drag when "Selection requires Shift" is on) |
+| Copy selected text | Drag to select, then release the mouse (`Shift`+drag when "Selection requires Shift" is on), or `Ctrl+Shift+C` |
+| Paste into terminal or chat | `Ctrl+Shift+V` |
+| Cut in chat | `Ctrl+Shift+X` |
+
+`Ctrl+C`, `Ctrl+V` and `Ctrl+X` are sent to the running program, so shortcuts inside TUIs such as nano keep working.
 
 Click the branch chip to switch branches (writes `git checkout <branch>` into the active terminal), or the changes chip to open the diff panel. In the branch picker, type to filter, use `↑`/`↓` to navigate, `Enter` to select and `Esc` to cancel.
 
@@ -64,7 +68,9 @@ commands by itself.
 Drag over terminal output or a chat message to select it. Releasing the mouse
 copies the selection to the clipboard and shows a brief "Copied to clipboard"
 notice in the bottom-right corner. `Ctrl+Shift+C` still copies the terminal
-selection without dragging.
+selection without dragging, and `Ctrl+Shift+V` pastes the clipboard into the
+terminal or the chat composer. Plain `Ctrl+C` / `Ctrl+V` / `Ctrl+X` go to the
+running program instead.
 
 TUIs such as opencode and Herdr capture the mouse. By default repterm still
 selects on a plain drag outside mouse-capture mode, which steals drags from
