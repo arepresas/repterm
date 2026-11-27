@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented here.
 
+## [0.3.3](https://github.com/arepresas/repterm/compare/v0.3.2...v0.3.3) (2026-11-27)
+
+
+### Bug Fixes
+
+* restore Ctrl+U and finish English-only content ([fcca87f](https://github.com/arepresas/repterm/commit/fcca87f57997e484b07155a7d0a0052c6b93daeb))
+
 ## [0.3.2](https://github.com/arepresas/repterm/compare/v0.3.1...v0.3.2) (2026-11-26)
 
 
